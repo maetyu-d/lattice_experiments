@@ -53,6 +53,120 @@ juce::Colour harmonySpaceLayerColour (int layer)
     };
     return colours[(size_t) juce::jlimit (0, 7, layer)];
 }
+int resolvePreferredStrip (int preferredStrip, float midiNote) noexcept
+{
+    if (preferredStrip >= 0)
+        return juce::jlimit (0, 2, preferredStrip);
+    return midiNote < 54.0f ? 0 : (midiNote < 72.0f ? 1 : 2);
+}
+int parseWholeNumberOrFallback (const juce::String& text, int fallback) noexcept
+{
+    const auto trimmed = text.trim();
+    return trimmed.isEmpty() ? fallback : trimmed.getIntValue();
+}
+bool parseCcSpec (const juce::String& text, int& ccNumber, int& ccValue) noexcept
+{
+    const auto parts = juce::StringArray::fromTokens (text.trim(), "=,: ", "");
+    if (parts.isEmpty())
+        return false;
+
+    ccNumber = juce::jlimit (0, 127, parts[0].getIntValue());
+    ccValue = juce::jlimit (0, 127, parts.size() > 1 ? parts[1].getIntValue() : parts[0].getIntValue());
+    return true;
+}
+bool parseParameterSpec (const juce::String& text,
+                         juce::String& slotQualifier,
+                         juce::String& parameterToken,
+                         float& normalizedValue,
+                         bool& hasExplicitValue) noexcept
+{
+    auto spec = text.trim();
+    if (spec.isEmpty())
+        return false;
+
+    slotQualifier.clear();
+    parameterToken.clear();
+    normalizedValue = 0.0f;
+    hasExplicitValue = false;
+
+    auto target = spec;
+    if (const auto equalsIndex = spec.indexOfChar ('='); equalsIndex >= 0)
+    {
+        target = spec.substring (0, equalsIndex).trim();
+        normalizedValue = juce::jlimit (0.0f, 1.0f, (float) spec.substring (equalsIndex + 1).trim().getDoubleValue());
+        hasExplicitValue = true;
+    }
+
+    if (const auto colonIndex = target.indexOfChar (':'); colonIndex >= 0)
+    {
+        slotQualifier = target.substring (0, colonIndex).trim().toLowerCase();
+        parameterToken = target.substring (colonIndex + 1).trim();
+    }
+    else
+    {
+        parameterToken = target.trim();
+    }
+
+    return parameterToken.isNotEmpty();
+}
+juce::AudioProcessorParameter* resolvePluginParameter (juce::AudioProcessor& processor, const juce::String& parameterToken) noexcept
+{
+    auto token = parameterToken.trim();
+    if (token.isEmpty())
+        return nullptr;
+
+    if (token.startsWithChar ('#'))
+    {
+        const auto index = juce::jlimit (0, processor.getParameters().size() - 1, token.fromFirstOccurrenceOf ("#", false, false).getIntValue());
+        return processor.getParameters()[index];
+    }
+
+    if (token.startsWithIgnoreCase ("id:"))
+    {
+        const auto idToken = token.fromFirstOccurrenceOf ("id:", false, true).trim();
+        for (auto* parameter : processor.getParameters())
+        {
+            if (parameter == nullptr)
+                continue;
+
+            if (auto* withId = dynamic_cast<juce::AudioProcessorParameterWithID*> (parameter))
+                if (withId->paramID == idToken)
+                    return parameter;
+        }
+    }
+
+    for (auto* parameter : processor.getParameters())
+    {
+        if (parameter == nullptr)
+            continue;
+
+        if (auto* withId = dynamic_cast<juce::AudioProcessorParameterWithID*> (parameter))
+            if (withId->paramID == token)
+                return parameter;
+    }
+
+    for (auto* parameter : processor.getParameters())
+    {
+        if (parameter == nullptr)
+            continue;
+
+        const auto name = parameter->getName (256);
+        if (name.equalsIgnoreCase (token))
+            return parameter;
+    }
+
+    for (auto* parameter : processor.getParameters())
+    {
+        if (parameter == nullptr)
+            continue;
+
+        const auto name = parameter->getName (256);
+        if (name.containsIgnoreCase (token))
+            return parameter;
+    }
+
+    return nullptr;
+}
 bool isViewToggleKey (const juce::KeyPress& key) noexcept
 {
     const auto keyCode = std::tolower ((unsigned char) key.getKeyCode());
@@ -2666,6 +2780,7 @@ void MainComponent::applyMode (AppMode mode, ModeVariant variant, bool showTitle
     inspectorSizeMode = PanelSizeMode::defaultSize;
     visibleLayer = 0;
     initialiseGrid (mode);
+    updateTempoControl();
     initialiseSnakes();
     resetSynthVoices();
     resetDrumVoices();
@@ -2704,6 +2819,22 @@ void MainComponent::createUi()
     beatValue.setText ("", juce::dontSendNotification);
     toolValue.setText ("", juce::dontSendNotification);
     audioValue.setText ("", juce::dontSendNotification);
+    tempoControlLabel.setText ("Tempo", juce::dontSendNotification);
+    tempoControlLabel.setColour (juce::Label::textColourId, juce::Colours::white.withAlpha (0.92f));
+    tempoControlLabel.setJustificationType (juce::Justification::centredLeft);
+    tempoControlLabel.setFont (juce::FontOptions (13.0f, juce::Font::bold));
+    mainArea.addAndMakeVisible (tempoControlLabel);
+    tempoSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+    tempoSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 64, 24);
+    tempoSlider.setRange (40.0, 220.0, 1.0);
+    tempoSlider.onValueChange = [this]
+    {
+        bpm = tempoSlider.getValue();
+        publishPatchSnapshot();
+        updateTempoControl();
+    };
+    mainArea.addAndMakeVisible (tempoSlider);
+    updateTempoControl();
     playButton.addListener (this);
     clearButton.addListener (this);
     spawnSnakeButton.addListener (this);
@@ -2714,6 +2845,7 @@ void MainComponent::createUi()
     layerUpButton.addListener (this);
     sidebarToggleButton.addListener (this);
     resumeModeButton.addListener (this);
+    rescanPluginsButton.addListener (this);
     a1ModeButton.addListener (this);
     a2ModeButton.addListener (this);
     a3ModeButton.addListener (this);
@@ -2734,6 +2866,7 @@ void MainComponent::createUi()
     addAndMakeVisible (layerUpButton);
     addAndMakeVisible (eraseButton);
     addAndMakeVisible (resumeModeButton);
+    addAndMakeVisible (rescanPluginsButton);
     addAndMakeVisible (a1ModeButton);
     addAndMakeVisible (a2ModeButton);
     addAndMakeVisible (a3ModeButton);
@@ -2754,29 +2887,53 @@ void MainComponent::createUi()
         mixerStripLabels[(size_t) strip].setFont (juce::FontOptions (15.0f, juce::Font::bold));
 
         auto& midiFxButton = mixerMidiFxButtons[(size_t) strip];
+        auto& midiFxGuiButton = mixerMidiFxGuiButtons[(size_t) strip];
         auto& instrumentButton = mixerInstrumentButtons[(size_t) strip];
+        auto& instrumentGuiButton = mixerInstrumentGuiButtons[(size_t) strip];
         auto& effectAButton = mixerEffectAButtons[(size_t) strip];
+        auto& effectAGuiButton = mixerEffectAGuiButtons[(size_t) strip];
         auto& effectBButton = mixerEffectBButtons[(size_t) strip];
+        auto& effectBGuiButton = mixerEffectBGuiButtons[(size_t) strip];
         auto& effectCButton = mixerEffectCButtons[(size_t) strip];
+        auto& effectCGuiButton = mixerEffectCGuiButtons[(size_t) strip];
         auto& effectDButton = mixerEffectDButtons[(size_t) strip];
+        auto& effectDGuiButton = mixerEffectDGuiButtons[(size_t) strip];
         midiFxButton.setButtonText ("Load MIDI FX");
+        midiFxGuiButton.setButtonText ("UI");
         instrumentButton.setButtonText ("Load Instrument");
+        instrumentGuiButton.setButtonText ("UI");
         effectAButton.setButtonText ("Load FX A");
+        effectAGuiButton.setButtonText ("UI");
         effectBButton.setButtonText ("Load FX B");
+        effectBGuiButton.setButtonText ("UI");
         effectCButton.setButtonText ("Load FX C");
+        effectCGuiButton.setButtonText ("UI");
         effectDButton.setButtonText ("Load FX D");
+        effectDGuiButton.setButtonText ("UI");
         midiFxButton.setComponentID ("strip" + juce::String (strip) + "_midiFx");
+        midiFxGuiButton.setComponentID ("strip" + juce::String (strip) + "_midiFxGui");
         instrumentButton.setComponentID ("strip" + juce::String (strip) + "_instrument");
+        instrumentGuiButton.setComponentID ("strip" + juce::String (strip) + "_instrumentGui");
         effectAButton.setComponentID ("strip" + juce::String (strip) + "_fxA");
+        effectAGuiButton.setComponentID ("strip" + juce::String (strip) + "_fxAGui");
         effectBButton.setComponentID ("strip" + juce::String (strip) + "_fxB");
+        effectBGuiButton.setComponentID ("strip" + juce::String (strip) + "_fxBGui");
         effectCButton.setComponentID ("strip" + juce::String (strip) + "_fxC");
+        effectCGuiButton.setComponentID ("strip" + juce::String (strip) + "_fxCGui");
         effectDButton.setComponentID ("strip" + juce::String (strip) + "_fxD");
+        effectDGuiButton.setComponentID ("strip" + juce::String (strip) + "_fxDGui");
         midiFxButton.addListener (this);
+        midiFxGuiButton.addListener (this);
         instrumentButton.addListener (this);
+        instrumentGuiButton.addListener (this);
         effectAButton.addListener (this);
+        effectAGuiButton.addListener (this);
         effectBButton.addListener (this);
+        effectBGuiButton.addListener (this);
         effectCButton.addListener (this);
+        effectCGuiButton.addListener (this);
         effectDButton.addListener (this);
+        effectDGuiButton.addListener (this);
 
         for (auto pair : { std::pair<juce::TextButton*, PluginSlotKind> { &midiFxButton, PluginSlotKind::midiFx },
                            { &instrumentButton, PluginSlotKind::instrument },
@@ -2790,20 +2947,44 @@ void MainComponent::createUi()
             pair.first->setColour (juce::TextButton::textColourOffId, juce::Colours::white.withAlpha (0.96f));
             pair.first->setColour (juce::TextButton::textColourOnId, juce::Colours::white);
         }
+        instrumentGuiButton.setColour (juce::TextButton::buttonColourId, juce::Colour::fromFloatRGBA (0.10f, 0.14f, 0.16f, 0.92f));
+        instrumentGuiButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour::fromFloatRGBA (0.26f, 0.96f, 1.0f, 0.48f));
+        instrumentGuiButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white.withAlpha (0.96f));
+        instrumentGuiButton.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+        for (auto* guiButton : { &midiFxGuiButton, &effectAGuiButton, &effectBGuiButton, &effectCGuiButton, &effectDGuiButton })
+        {
+            guiButton->setColour (juce::TextButton::buttonColourId, juce::Colour::fromFloatRGBA (0.10f, 0.14f, 0.16f, 0.92f));
+            guiButton->setColour (juce::TextButton::buttonOnColourId, juce::Colour::fromFloatRGBA (0.9f, 0.9f, 0.9f, 0.28f));
+            guiButton->setColour (juce::TextButton::textColourOffId, juce::Colours::white.withAlpha (0.96f));
+            guiButton->setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+        }
 
         mixerArea.addAndMakeVisible (midiFxButton);
+        mixerArea.addAndMakeVisible (midiFxGuiButton);
         mixerArea.addAndMakeVisible (instrumentButton);
+        mixerArea.addAndMakeVisible (instrumentGuiButton);
         mixerArea.addAndMakeVisible (effectAButton);
+        mixerArea.addAndMakeVisible (effectAGuiButton);
         mixerArea.addAndMakeVisible (effectBButton);
+        mixerArea.addAndMakeVisible (effectBGuiButton);
         mixerArea.addAndMakeVisible (effectCButton);
+        mixerArea.addAndMakeVisible (effectCGuiButton);
         mixerArea.addAndMakeVisible (effectDButton);
+        mixerArea.addAndMakeVisible (effectDGuiButton);
 
         auto& volumeSlider = mixerVolumeSliders[(size_t) strip];
         auto& panSlider = mixerPanSliders[(size_t) strip];
+        const auto stripAccent = strip == 0 ? juce::Colour::fromFloatRGBA (0.92f, 0.86f, 0.22f, 1.0f)
+                                            : (strip == 1 ? juce::Colour::fromFloatRGBA (0.18f, 0.96f, 1.0f, 1.0f)
+                                                          : juce::Colour::fromFloatRGBA (1.0f, 0.34f, 0.84f, 1.0f));
         volumeSlider.setSliderStyle (juce::Slider::LinearVertical);
         volumeSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 52, 18);
         volumeSlider.setRange (0.0, 1.2, 0.01);
         volumeSlider.setValue (mixerStrips[(size_t) strip].volume);
+        volumeSlider.setAccentColour (stripAccent);
+        volumeSlider.setColour (juce::Slider::textBoxTextColourId, juce::Colours::white.withAlpha (0.92f));
+        volumeSlider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+        volumeSlider.setColour (juce::Slider::textBoxBackgroundColourId, juce::Colour::fromFloatRGBA (0.08f, 0.11f, 0.14f, 0.92f));
         volumeSlider.onValueChange = [this, strip] { mixerStrips[(size_t) strip].volume = (float) mixerVolumeSliders[(size_t) strip].getValue(); };
         panSlider.setSliderStyle (juce::Slider::LinearHorizontal);
         panSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 52, 18);
@@ -3008,6 +3189,7 @@ void MainComponent::createUi()
     };
 
     for (auto type : { GlyphType::pulse, GlyphType::tone, GlyphType::voice, GlyphType::chord, GlyphType::key, GlyphType::octave,
+                       GlyphType::route, GlyphType::channel, GlyphType::cc, GlyphType::parameter,
                        GlyphType::tempo, GlyphType::ratchet, GlyphType::repeat, GlyphType::wormhole, GlyphType::kick, GlyphType::snare,
                        GlyphType::hat, GlyphType::clap, GlyphType::length, GlyphType::accent, GlyphType::decay, GlyphType::noise, GlyphType::mul,
                        GlyphType::bias, GlyphType::hue, GlyphType::audio, GlyphType::visual })
@@ -3031,6 +3213,16 @@ void MainComponent::createUi()
     renderInspector();
     updateCellButtons();
     updateMixerButtons();
+}
+
+void MainComponent::updateTempoControl()
+{
+    tempoSlider.setTextValueSuffix (" BPM");
+
+    if (std::abs (tempoSlider.getValue() - bpm) > 0.5)
+        tempoSlider.setValue (bpm, juce::dontSendNotification);
+
+    bpmValue.setText ("", juce::dontSendNotification);
 }
 
 void MainComponent::paint (juce::Graphics& g)
@@ -3188,6 +3380,8 @@ void MainComponent::resized()
         stage.setVisible (false);
         toolViewport.setVisible (false);
         sidebarToggleButton.setVisible (false);
+        tempoControlLabel.setVisible (false);
+        tempoSlider.setVisible (false);
 
         for (auto* button : toolButtons)
             button->setVisible (false);
@@ -3223,8 +3417,12 @@ void MainComponent::resized()
         b2ModeButton.setVisible (true);
         b3ModeButton.setVisible (true);
         b4ModeButton.setVisible (true);
+        rescanPluginsButton.setVisible (true);
+        layoutMixer ({});
         if (hasResumableSession)
             resumeModeButton.setBounds (resumeRow.reduced (180, 12));
+        auto rescanRow = titleArea.removeFromBottom (72);
+        rescanPluginsButton.setBounds (rescanRow.withSizeKeepingCentre (220, 42));
         auto upperRow = row.removeFromTop (row.getHeight() / 2);
         auto lowerRow = row;
         auto quarterTop = upperRow.getWidth() / 4;
@@ -3243,6 +3441,8 @@ void MainComponent::resized()
     sidebar.setVisible (true);
     mainArea.setVisible (true);
     sidebarToggleButton.setVisible (true);
+    tempoControlLabel.setVisible (true);
+    tempoSlider.setVisible (true);
 
     for (auto* button : cellButtons)
         button->setVisible (true);
@@ -3267,6 +3467,7 @@ void MainComponent::resized()
     b2ModeButton.setVisible (false);
     b3ModeButton.setVisible (false);
     b4ModeButton.setVisible (false);
+    rescanPluginsButton.setVisible (false);
 
     auto footer = area.removeFromBottom (56);
     const auto footerButtonBounds = [] (juce::Rectangle<int> area, int xPad) { return area.reduced (xPad, 10).translated (0, 2); };
@@ -3283,7 +3484,7 @@ void MainComponent::resized()
     layerUpButton.setBounds (footerButtonBounds (layerControls.removeFromLeft (96), 6));
     saveButton.setBounds (footerButtonBounds (layerControls.removeFromLeft (92), 6));
     loadButton.setBounds (footerButtonBounds (layerControls.removeFromLeft (92), 6));
-    bpmValue.setBounds (footer.removeFromLeft (110));
+    bpmValue.setBounds ({});
     beatValue.setBounds ({});
     toolValue.setBounds ({});
     audioValue.setBounds (footer.removeFromLeft (160));
@@ -3315,7 +3516,12 @@ void MainComponent::resized()
 
     mainArea.setBounds (area.reduced (16));
 
-    auto gridArea = mainArea.getBounds().reduced (14);
+    auto mainAreaLocal = mainArea.getLocalBounds().reduced (14);
+    auto tempoRow = mainAreaLocal.removeFromTop (34);
+    tempoControlLabel.setBounds (tempoRow.removeFromLeft (72));
+    tempoSlider.setBounds (tempoRow.reduced (4, 2));
+    mainAreaLocal.removeFromTop (10);
+    auto gridArea = mainAreaLocal.translated (mainArea.getX(), mainArea.getY());
     const auto gap = 8;
     auto cellWidth = (gridArea.getWidth() - gap * (cols - 1)) / cols;
     auto cellHeight = 70;
@@ -3336,7 +3542,7 @@ void MainComponent::resized()
     stage.setVisible (isHarmonySpaceMode || previewWidth > 0);
     if (isHarmonySpaceMode)
     {
-        auto stageBounds = mainArea.getBounds().reduced (18);
+        auto stageBounds = mainAreaLocal.translated (mainArea.getX(), mainArea.getY()).reduced (4);
         stage.setBounds (stageBounds);
     }
     else if (previewWidth > 0)
@@ -3354,6 +3560,8 @@ void MainComponent::resized()
 
     if (showingMixer)
         layoutMixer (mixerArea.getLocalBounds().reduced (16));
+    else
+        layoutMixer ({});
 
     auto sidebarContent = sidebar.getLocalBounds().reduced (10);
     sidebarToggleButton.setBounds (sidebarContent.removeFromTop (34));
@@ -3386,23 +3594,82 @@ void MainComponent::layoutInspector (juce::Rectangle<int> area)
 
 void MainComponent::layoutMixer (juce::Rectangle<int> area)
 {
+    const auto showMixerControls = mixerArea.isVisible() && isPluginMode() && mixerVisible && ! showingTitleScreen;
     auto stripWidth = area.getWidth() / (int) mixerStrips.size();
     for (int strip = 0; strip < (int) mixerStrips.size(); ++strip)
     {
+        mixerStripLabels[(size_t) strip].setVisible (showMixerControls);
+        mixerMidiFxButtons[(size_t) strip].setVisible (showMixerControls);
+        mixerMidiFxGuiButtons[(size_t) strip].setVisible (showMixerControls);
+        mixerInstrumentButtons[(size_t) strip].setVisible (showMixerControls);
+        mixerInstrumentGuiButtons[(size_t) strip].setVisible (showMixerControls);
+        mixerEffectAButtons[(size_t) strip].setVisible (showMixerControls);
+        mixerEffectAGuiButtons[(size_t) strip].setVisible (showMixerControls);
+        mixerEffectBButtons[(size_t) strip].setVisible (showMixerControls);
+        mixerEffectBGuiButtons[(size_t) strip].setVisible (showMixerControls);
+        mixerEffectCButtons[(size_t) strip].setVisible (showMixerControls);
+        mixerEffectCGuiButtons[(size_t) strip].setVisible (showMixerControls);
+        mixerEffectDButtons[(size_t) strip].setVisible (showMixerControls);
+        mixerEffectDGuiButtons[(size_t) strip].setVisible (showMixerControls);
+        mixerVolumeLabels[(size_t) strip].setVisible (showMixerControls);
+        mixerPanLabels[(size_t) strip].setVisible (showMixerControls);
+        mixerVolumeSliders[(size_t) strip].setVisible (showMixerControls);
+        mixerPanSliders[(size_t) strip].setVisible (showMixerControls);
+
+        if (! showMixerControls)
+        {
+            mixerStripLabels[(size_t) strip].setBounds ({});
+            mixerMidiFxButtons[(size_t) strip].setBounds ({});
+            mixerMidiFxGuiButtons[(size_t) strip].setBounds ({});
+            mixerInstrumentButtons[(size_t) strip].setBounds ({});
+            mixerInstrumentGuiButtons[(size_t) strip].setBounds ({});
+            mixerEffectAButtons[(size_t) strip].setBounds ({});
+            mixerEffectAGuiButtons[(size_t) strip].setBounds ({});
+            mixerEffectBButtons[(size_t) strip].setBounds ({});
+            mixerEffectBGuiButtons[(size_t) strip].setBounds ({});
+            mixerEffectCButtons[(size_t) strip].setBounds ({});
+            mixerEffectCGuiButtons[(size_t) strip].setBounds ({});
+            mixerEffectDButtons[(size_t) strip].setBounds ({});
+            mixerEffectDGuiButtons[(size_t) strip].setBounds ({});
+            mixerVolumeLabels[(size_t) strip].setBounds ({});
+            mixerPanLabels[(size_t) strip].setBounds ({});
+            mixerVolumeSliders[(size_t) strip].setBounds ({});
+            mixerPanSliders[(size_t) strip].setBounds ({});
+            continue;
+        }
+
         auto stripArea = area.removeFromLeft (strip == (int) mixerStrips.size() - 1 ? area.getWidth() : stripWidth).reduced (8);
         mixerStripLabels[(size_t) strip].setBounds (stripArea.removeFromTop (28));
         stripArea.removeFromTop (8);
-        mixerMidiFxButtons[(size_t) strip].setBounds (stripArea.removeFromTop (30));
+        auto midiFxRow = stripArea.removeFromTop (30);
+        mixerMidiFxGuiButtons[(size_t) strip].setBounds (midiFxRow.removeFromRight (38));
+        midiFxRow.removeFromRight (4);
+        mixerMidiFxButtons[(size_t) strip].setBounds (midiFxRow);
         stripArea.removeFromTop (5);
-        mixerInstrumentButtons[(size_t) strip].setBounds (stripArea.removeFromTop (34));
+        auto instrumentRow = stripArea.removeFromTop (34);
+        mixerInstrumentGuiButtons[(size_t) strip].setBounds (instrumentRow.removeFromRight (38));
+        instrumentRow.removeFromRight (4);
+        mixerInstrumentButtons[(size_t) strip].setBounds (instrumentRow);
         stripArea.removeFromTop (5);
-        mixerEffectAButtons[(size_t) strip].setBounds (stripArea.removeFromTop (28));
+        auto effectARow = stripArea.removeFromTop (28);
+        mixerEffectAGuiButtons[(size_t) strip].setBounds (effectARow.removeFromRight (38));
+        effectARow.removeFromRight (4);
+        mixerEffectAButtons[(size_t) strip].setBounds (effectARow);
         stripArea.removeFromTop (4);
-        mixerEffectBButtons[(size_t) strip].setBounds (stripArea.removeFromTop (28));
+        auto effectBRow = stripArea.removeFromTop (28);
+        mixerEffectBGuiButtons[(size_t) strip].setBounds (effectBRow.removeFromRight (38));
+        effectBRow.removeFromRight (4);
+        mixerEffectBButtons[(size_t) strip].setBounds (effectBRow);
         stripArea.removeFromTop (4);
-        mixerEffectCButtons[(size_t) strip].setBounds (stripArea.removeFromTop (28));
+        auto effectCRow = stripArea.removeFromTop (28);
+        mixerEffectCGuiButtons[(size_t) strip].setBounds (effectCRow.removeFromRight (38));
+        effectCRow.removeFromRight (4);
+        mixerEffectCButtons[(size_t) strip].setBounds (effectCRow);
         stripArea.removeFromTop (4);
-        mixerEffectDButtons[(size_t) strip].setBounds (stripArea.removeFromTop (28));
+        auto effectDRow = stripArea.removeFromTop (28);
+        mixerEffectDGuiButtons[(size_t) strip].setBounds (effectDRow.removeFromRight (38));
+        effectDRow.removeFromRight (4);
+        mixerEffectDButtons[(size_t) strip].setBounds (effectDRow);
         stripArea.removeFromTop (10);
         mixerVolumeLabels[(size_t) strip].setBounds (stripArea.removeFromTop (18));
         mixerVolumeSliders[(size_t) strip].setBounds (stripArea.removeFromTop (juce::jmax (140, stripArea.getHeight() - 90)));
@@ -3435,22 +3702,158 @@ MainComponent::ModeVariant MainComponent::stringToModeVariant (const juce::Strin
 void MainComponent::initialisePluginHosting()
 {
    #if JUCE_PLUGINHOST_AU
-    pluginFormatManager.addFormat (new juce::AudioUnitPluginFormat());
+    pluginFormatManager.addFormat (std::make_unique<juce::AudioUnitPluginFormat>());
    #endif
    #if JUCE_PLUGINHOST_VST3
-    pluginFormatManager.addFormat (new juce::VST3PluginFormat());
+    pluginFormatManager.addFormat (std::make_unique<juce::VST3PluginFormat>());
    #endif
+    loadCachedOrScanPluginDescriptions();
     clearPluginProcessingState();
+}
+
+juce::File MainComponent::getPluginCacheFile() const
+{
+    auto dir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+                   .getChildFile ("GlyphGrid");
+    dir.createDirectory();
+    return dir.getChildFile ("plugin-cache.json");
+}
+
+void MainComponent::savePluginCache() const
+{
+    auto root = std::make_unique<juce::DynamicObject>();
+    root->setProperty ("version", 1);
+    juce::var pluginsVar { juce::Array<juce::var>() };
+    auto* array = pluginsVar.getArray();
+    for (const auto& description : cachedPluginDescriptions)
+    {
+        auto item = std::make_unique<juce::DynamicObject>();
+        item->setProperty ("name", description.name);
+        item->setProperty ("descriptiveName", description.descriptiveName);
+        item->setProperty ("fileOrIdentifier", description.fileOrIdentifier);
+        item->setProperty ("pluginFormatName", description.pluginFormatName);
+        item->setProperty ("category", description.category);
+        item->setProperty ("manufacturerName", description.manufacturerName);
+        item->setProperty ("version", description.version);
+        item->setProperty ("isInstrument", description.isInstrument);
+        item->setProperty ("numInputChannels", description.numInputChannels);
+        item->setProperty ("numOutputChannels", description.numOutputChannels);
+        item->setProperty ("uid", (int64) description.uniqueId);
+        array->add (juce::var (item.release()));
+    }
+    root->setProperty ("plugins", pluginsVar);
+    getPluginCacheFile().replaceWithText (juce::JSON::toString (juce::var (root.release()), true));
+}
+
+bool MainComponent::loadPluginCache()
+{
+    const auto file = getPluginCacheFile();
+    if (! file.existsAsFile())
+        return false;
+
+    const auto parsed = juce::JSON::parse (file.loadFileAsString());
+    auto* root = parsed.getDynamicObject();
+    auto* array = root != nullptr ? root->getProperty ("plugins").getArray() : nullptr;
+    if (array == nullptr)
+        return false;
+
+    cachedPluginDescriptions.clearQuick();
+    for (const auto& itemVar : *array)
+    {
+        auto* item = itemVar.getDynamicObject();
+        if (item == nullptr)
+            continue;
+
+        juce::PluginDescription description;
+        description.name = item->getProperty ("name").toString();
+        description.descriptiveName = item->getProperty ("descriptiveName").toString();
+        description.fileOrIdentifier = item->getProperty ("fileOrIdentifier").toString();
+        description.pluginFormatName = item->getProperty ("pluginFormatName").toString();
+        description.category = item->getProperty ("category").toString();
+        description.manufacturerName = item->getProperty ("manufacturerName").toString();
+        description.version = item->getProperty ("version").toString();
+        description.isInstrument = (bool) item->getProperty ("isInstrument");
+        description.numInputChannels = (int) item->getProperty ("numInputChannels");
+        description.numOutputChannels = (int) item->getProperty ("numOutputChannels");
+        description.uniqueId = (int) (int64) item->getProperty ("uid");
+        if (description.name.isNotEmpty() && description.fileOrIdentifier.isNotEmpty())
+            cachedPluginDescriptions.add (description);
+    }
+
+    return cachedPluginDescriptions.size() > 0;
+}
+
+void MainComponent::scanLogicPluginFolders()
+{
+    cachedPluginDescriptions.clearQuick();
+
+   #if JUCE_PLUGINHOST_AU
+    juce::Array<juce::File> componentFiles;
+    const auto addComponentsFrom = [&componentFiles] (const juce::File& dir)
+    {
+        if (! dir.isDirectory())
+            return;
+        juce::Array<juce::File> found;
+        dir.findChildFiles (found, juce::File::findDirectories, false, "*.component");
+        componentFiles.addArray (found);
+    };
+
+    addComponentsFrom (juce::File ("/Library/Audio/Plug-Ins/Components"));
+    addComponentsFrom (juce::File::getSpecialLocation (juce::File::userHomeDirectory)
+                           .getChildFile ("Library/Audio/Plug-Ins/Components"));
+
+    juce::AudioUnitPluginFormat* auFormat = nullptr;
+    for (auto* format : pluginFormatManager.getFormats())
+        if (dynamic_cast<juce::AudioUnitPluginFormat*> (format) != nullptr)
+            auFormat = dynamic_cast<juce::AudioUnitPluginFormat*> (format);
+
+    if (auFormat != nullptr)
+    {
+        for (const auto& file : componentFiles)
+        {
+            juce::OwnedArray<juce::PluginDescription> descriptions;
+            auFormat->findAllTypesForFile (descriptions, file.getFullPathName());
+            for (auto* desc : descriptions)
+                if (desc != nullptr)
+                {
+                    auto exists = false;
+                    for (const auto& existing : cachedPluginDescriptions)
+                    {
+                        if (existing.fileOrIdentifier == desc->fileOrIdentifier
+                            && existing.name == desc->name
+                            && existing.pluginFormatName == desc->pluginFormatName)
+                        {
+                            exists = true;
+                            break;
+                        }
+                    }
+
+                    if (! exists)
+                        cachedPluginDescriptions.add (*desc);
+                }
+        }
+    }
+   #endif
+
+    savePluginCache();
+}
+
+void MainComponent::loadCachedOrScanPluginDescriptions()
+{
+    if (! loadPluginCache())
+        scanLogicPluginFolders();
 }
 
 void MainComponent::clearPluginProcessingState() noexcept
 {
-    for (auto& strip : mixerStrips)
+    for (int stripIndex = 0; stripIndex < (int) mixerStrips.size(); ++stripIndex)
     {
+        auto& strip = mixerStrips[(size_t) stripIndex];
         strip.midiBuffer.clear();
         strip.pendingMidi.clear();
         strip.audioBuffer.setSize (2, 0, false, false, true);
         strip.midiFxScratchBuffer.setSize (2, 0, false, false, true);
+        publishedMixerLevels[(size_t) stripIndex].store (0.0f, std::memory_order_relaxed);
     }
 }
 
@@ -3545,6 +3948,56 @@ bool MainComponent::loadPluginIntoSlot (int stripIndex, PluginSlotKind slotKind,
     return true;
 }
 
+bool MainComponent::loadPluginIntoSlot (int stripIndex, PluginSlotKind slotKind, const juce::PluginDescription& description)
+{
+    juce::String error;
+    auto instance = std::unique_ptr<juce::AudioPluginInstance> (
+        pluginFormatManager.createPluginInstance (description, currentSampleRate, currentPluginBlockSize, error));
+
+    if (instance == nullptr)
+        return false;
+
+    instance->prepareToPlay (currentSampleRate, currentPluginBlockSize);
+    auto& slot = getHostedPluginSlot (stripIndex, slotKind);
+    if (slot.instance != nullptr)
+        slot.instance->releaseResources();
+    slot.instance = std::move (instance);
+    slot.buttonText = description.name.isNotEmpty() ? description.name : description.descriptiveName;
+    slot.pluginPath = description.fileOrIdentifier;
+    updateMixerButtons();
+    return true;
+}
+
+juce::String MainComponent::serialisePluginState (const HostedPluginSlot& slot)
+{
+    if (slot.instance == nullptr)
+        return {};
+
+    juce::MemoryBlock state;
+    slot.instance->getStateInformation (state);
+
+    if (state.getSize() == 0)
+        return {};
+
+    return juce::Base64::toBase64 (state.getData(), state.getSize());
+}
+
+void MainComponent::restorePluginState (HostedPluginSlot& slot, const juce::String& encodedState)
+{
+    if (slot.instance == nullptr || encodedState.isEmpty())
+        return;
+
+    juce::MemoryOutputStream output;
+    if (! juce::Base64::convertFromBase64 (output, encodedState))
+        return;
+
+    const auto dataSize = output.getDataSize();
+    if (dataSize == 0)
+        return;
+
+    slot.instance->setStateInformation (output.getData(), (int) dataSize);
+}
+
 void MainComponent::updateMixerButtons()
 {
     for (int strip = 0; strip < (int) mixerStrips.size(); ++strip)
@@ -3559,11 +4012,107 @@ void MainComponent::updateMixerButtons()
 
         setSlotText (mixerMidiFxButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::midiFx), PluginSlotKind::midiFx, "Load MIDI FX");
         setSlotText (mixerInstrumentButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::instrument), PluginSlotKind::instrument, "Load Instrument");
+        mixerMidiFxGuiButtons[(size_t) strip].setEnabled (getHostedPluginSlot (strip, PluginSlotKind::midiFx).instance != nullptr
+                                                          && getHostedPluginSlot (strip, PluginSlotKind::midiFx).instance->hasEditor());
+        mixerInstrumentGuiButtons[(size_t) strip].setEnabled (getHostedPluginSlot (strip, PluginSlotKind::instrument).instance != nullptr
+                                                               && getHostedPluginSlot (strip, PluginSlotKind::instrument).instance->hasEditor());
         setSlotText (mixerEffectAButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::effectA), PluginSlotKind::effectA, "Load FX A");
         setSlotText (mixerEffectBButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::effectB), PluginSlotKind::effectB, "Load FX B");
         setSlotText (mixerEffectCButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::effectC), PluginSlotKind::effectC, "Load FX C");
         setSlotText (mixerEffectDButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::effectD), PluginSlotKind::effectD, "Load FX D");
+        mixerEffectAGuiButtons[(size_t) strip].setEnabled (getHostedPluginSlot (strip, PluginSlotKind::effectA).instance != nullptr
+                                                           && getHostedPluginSlot (strip, PluginSlotKind::effectA).instance->hasEditor());
+        mixerEffectBGuiButtons[(size_t) strip].setEnabled (getHostedPluginSlot (strip, PluginSlotKind::effectB).instance != nullptr
+                                                           && getHostedPluginSlot (strip, PluginSlotKind::effectB).instance->hasEditor());
+        mixerEffectCGuiButtons[(size_t) strip].setEnabled (getHostedPluginSlot (strip, PluginSlotKind::effectC).instance != nullptr
+                                                           && getHostedPluginSlot (strip, PluginSlotKind::effectC).instance->hasEditor());
+        mixerEffectDGuiButtons[(size_t) strip].setEnabled (getHostedPluginSlot (strip, PluginSlotKind::effectD).instance != nullptr
+                                                           && getHostedPluginSlot (strip, PluginSlotKind::effectD).instance->hasEditor());
     }
+}
+
+void MainComponent::showPluginEditor (int stripIndex, PluginSlotKind slotKind)
+{
+    auto& strip = mixerStrips[(size_t) juce::jlimit (0, (int) mixerStrips.size() - 1, stripIndex)];
+    auto& slot = getHostedPluginSlot (stripIndex, slotKind);
+    if (slot.instance == nullptr || ! slot.instance->hasEditor())
+        return;
+
+    if (strip.pluginWindow != nullptr)
+    {
+        strip.pluginWindow->toFront (true);
+        return;
+    }
+
+    struct PluginEditorWindow final : juce::DocumentWindow
+    {
+        PluginEditorWindow (juce::String name, std::unique_ptr<juce::AudioProcessorEditor> editor, std::function<void()> onCloseIn)
+            : juce::DocumentWindow (std::move (name),
+                                    juce::Colour::fromFloatRGBA (0.08f, 0.10f, 0.12f, 0.98f),
+                                    juce::DocumentWindow::closeButton),
+              onClose (std::move (onCloseIn))
+        {
+            setUsingNativeTitleBar (true);
+            setResizable (true, true);
+            setContentOwned (editor.release(), true);
+            centreWithSize (juce::jmax (520, getContentComponent()->getWidth()),
+                            juce::jmax (340, getContentComponent()->getHeight()));
+            setVisible (true);
+        }
+
+        void closeButtonPressed() override
+        {
+            if (onClose)
+                onClose();
+        }
+
+        std::function<void()> onClose;
+    };
+
+    auto editor = std::unique_ptr<juce::AudioProcessorEditor> (slot.instance->createEditor());
+    if (editor == nullptr)
+        return;
+
+    strip.pluginWindow = std::make_unique<PluginEditorWindow> (
+        strip.name + " " + mixerSlotPrefix (slotKind),
+        std::move (editor),
+        [this, stripIndex]
+        {
+            mixerStrips[(size_t) stripIndex].pluginWindow.reset();
+        });
+}
+
+bool MainComponent::isMidiFxPlugin (const juce::PluginDescription& description) noexcept
+{
+    return description.category.containsIgnoreCase ("midi")
+        || description.name.containsIgnoreCase ("midi")
+        || description.descriptiveName.containsIgnoreCase ("midi");
+}
+
+bool MainComponent::isInstrumentPlugin (const juce::PluginDescription& description) noexcept
+{
+    return description.isInstrument;
+}
+
+juce::Array<juce::PluginDescription> MainComponent::getPluginChoicesForSlot (PluginSlotKind slotKind) const
+{
+    juce::Array<juce::PluginDescription> result;
+    for (const auto& description : cachedPluginDescriptions)
+    {
+        const auto midiFx = isMidiFxPlugin (description);
+        const auto instrument = isInstrumentPlugin (description);
+        const auto allow = slotKind == PluginSlotKind::midiFx ? midiFx
+                        : (slotKind == PluginSlotKind::instrument ? instrument
+                                                                  : (! instrument));
+        if (allow)
+            result.add (description);
+    }
+
+    std::sort (result.begin(), result.end(), [] (const auto& a, const auto& b)
+    {
+        return a.name.compareIgnoreCase (b.name) < 0;
+    });
+    return result;
 }
 
 void MainComponent::queuePluginMessage (int stripIndex, const juce::MidiMessage& message, int absoluteSampleOffset) noexcept
@@ -3578,20 +4127,101 @@ void MainComponent::queuePluginMessage (int stripIndex, const juce::MidiMessage&
     strip.pendingMidi.push_back ({ absoluteSampleOffset - currentPluginBlockSize, message });
 }
 
-void MainComponent::queuePluginNote (int preferredStrip, float midiNote, float amplitude, float decayScale, int delaySamples) noexcept
+void MainComponent::queuePluginNote (int preferredStrip,
+                                     int midiChannel,
+                                     float midiNote,
+                                     float amplitude,
+                                     float decayScale,
+                                     int delaySamples,
+                                     float pitchBend,
+                                     float channelPressure,
+                                     int ccNumber,
+                                     int ccValue) noexcept
 {
     const auto noteNumber = juce::jlimit (0, 127, (int) std::round (midiNote));
-    auto stripIndex = preferredStrip;
-    if (stripIndex < 0)
-        stripIndex = noteNumber < 54 ? 0 : (noteNumber < 72 ? 1 : 2);
+    const auto stripIndex = resolvePreferredStrip (preferredStrip, midiNote);
+    const auto channel = juce::jlimit (1, 16, midiChannel);
 
     const auto velocity = juce::jlimit (1, 127, (int) std::round (amplitude * 127.0f));
     const auto noteOnOffset = currentAudioBlockSampleOffset + juce::jmax (0, delaySamples);
     const auto durationSamples = juce::jlimit (512,
                                                (int) (currentSampleRate * 4.0),
                                                (int) std::round (currentSampleRate * 0.18 * juce::jlimit (0.4f, 4.0f, (float) decayScale)));
-    queuePluginMessage (stripIndex, juce::MidiMessage::noteOn (1, noteNumber, (juce::uint8) velocity), noteOnOffset);
-    queuePluginMessage (stripIndex, juce::MidiMessage::noteOff (1, noteNumber), noteOnOffset + durationSamples);
+    if (ccNumber >= 0)
+        queuePluginMessage (stripIndex, juce::MidiMessage::controllerEvent (channel, juce::jlimit (0, 127, ccNumber), juce::jlimit (0, 127, ccValue)), noteOnOffset);
+
+    if (std::abs (pitchBend) > 0.0001f)
+    {
+        const auto bendValue = juce::jlimit (0, 16383, (int) std::round (8192.0 + juce::jlimit (-1.0f, 1.0f, pitchBend) * 8191.0));
+        queuePluginMessage (stripIndex, juce::MidiMessage::pitchWheel (channel, bendValue), noteOnOffset);
+        queuePluginMessage (stripIndex, juce::MidiMessage::pitchWheel (channel, 8192), noteOnOffset + durationSamples + 1);
+    }
+
+    if (channelPressure > 0.0001f)
+    {
+        const auto pressureValue = juce::jlimit (0, 127, (int) std::round (juce::jlimit (0.0f, 1.0f, channelPressure) * 127.0f));
+        queuePluginMessage (stripIndex, juce::MidiMessage::channelPressureChange (channel, pressureValue), noteOnOffset);
+        queuePluginMessage (stripIndex, juce::MidiMessage::channelPressureChange (channel, 0), noteOnOffset + durationSamples + 1);
+    }
+
+    queuePluginMessage (stripIndex, juce::MidiMessage::noteOn (channel, noteNumber, (juce::uint8) velocity), noteOnOffset);
+    queuePluginMessage (stripIndex, juce::MidiMessage::noteOff (channel, noteNumber), noteOnOffset + durationSamples);
+}
+
+void MainComponent::applyPluginParameterTarget (int preferredStrip, float midiNote, const juce::String& targetSpec, float fallbackNormalized) noexcept
+{
+    juce::String slotQualifier, parameterToken;
+    auto normalizedValue = 0.0f;
+    auto hasExplicitValue = false;
+    if (! parseParameterSpec (targetSpec, slotQualifier, parameterToken, normalizedValue, hasExplicitValue))
+        return;
+
+    if (! hasExplicitValue)
+        normalizedValue = juce::jlimit (0.0f, 1.0f, fallbackNormalized);
+
+    const auto stripIndex = resolvePreferredStrip (preferredStrip, midiNote);
+    auto tryApply = [&] (HostedPluginSlot& slot) -> bool
+    {
+        if (slot.instance == nullptr)
+            return false;
+
+        auto* parameter = resolvePluginParameter (*slot.instance, parameterToken);
+        if (parameter == nullptr)
+            return false;
+
+        parameter->beginChangeGesture();
+        parameter->setValueNotifyingHost (normalizedValue);
+        parameter->endChangeGesture();
+        return true;
+    };
+
+    auto& strip = mixerStrips[(size_t) stripIndex];
+    auto tryQualifiedSlot = [&] () -> bool
+    {
+        if (slotQualifier == "midi")
+            return tryApply (strip.midiFx);
+        if (slotQualifier == "inst")
+            return tryApply (strip.instrument);
+        if (slotQualifier == "fx1")
+            return tryApply (strip.effectA);
+        if (slotQualifier == "fx2")
+            return tryApply (strip.effectB);
+        if (slotQualifier == "fx3")
+            return tryApply (strip.effectC);
+        if (slotQualifier == "fx4")
+            return tryApply (strip.effectD);
+        return false;
+    };
+
+    if (slotQualifier.isNotEmpty())
+    {
+        tryQualifiedSlot();
+        return;
+    }
+
+    for (auto* slot : { &strip.instrument, &strip.effectA, &strip.effectB, &strip.effectC, &strip.effectD, &strip.midiFx })
+        if (tryApply (*slot))
+            return;
 }
 
 void MainComponent::flushPendingPluginEventsForBlock (int blockSize) noexcept
@@ -3673,6 +4303,17 @@ void MainComponent::processPluginBlock (const juce::AudioSourceChannelInfo& buff
 
         const auto leftGain = strip.volume * (strip.pan <= 0.0f ? 1.0f : 1.0f - strip.pan);
         const auto rightGain = strip.volume * (strip.pan >= 0.0f ? 1.0f : 1.0f + strip.pan);
+        auto peak = 0.0f;
+        for (int channel = 0; channel < strip.audioBuffer.getNumChannels(); ++channel)
+        {
+            const auto* read = strip.audioBuffer.getReadPointer (channel);
+            const auto gain = channel == 0 ? leftGain : rightGain;
+            for (int sample = 0; sample < bufferToFill.numSamples; ++sample)
+                peak = juce::jmax (peak, std::abs (read[sample] * gain));
+        }
+        const auto previousLevel = publishedMixerLevels[(size_t) stripIndex].load (std::memory_order_relaxed);
+        const auto smoothedLevel = juce::jmax (peak, previousLevel * 0.90f);
+        publishedMixerLevels[(size_t) stripIndex].store (juce::jlimit (0.0f, 1.0f, smoothedLevel), std::memory_order_relaxed);
         outputBuffer->addFrom (0, bufferToFill.startSample, strip.audioBuffer, 0, 0, bufferToFill.numSamples, leftGain);
         if (outputBuffer->getNumChannels() > 1)
             outputBuffer->addFrom (1, bufferToFill.startSample, strip.audioBuffer, juce::jmin (1, strip.audioBuffer.getNumChannels() - 1), 0, bufferToFill.numSamples, rightGain);
@@ -3804,6 +4445,8 @@ void MainComponent::timerCallback()
     const auto transportSnapshot = getTransportSnapshot();
     beatValue.setText ("", juce::dontSendNotification);
     stepLabel.setText ("Snakes " + juce::String (transportSnapshot.snakeCount), juce::dontSendNotification);
+    for (int strip = 0; strip < (int) mixerVolumeSliders.size(); ++strip)
+        mixerVolumeSliders[(size_t) strip].setMeterLevel (publishedMixerLevels[(size_t) strip].load (std::memory_order_relaxed));
     updateCellButtons();
 }
 
@@ -3835,6 +4478,14 @@ void MainComponent::buttonClicked (juce::Button* button)
     {
         showingTitleScreen = false;
         resized();
+        repaint();
+        return;
+    }
+
+    if (button == &rescanPluginsButton)
+    {
+        scanLogicPluginFolders();
+        updateMixerButtons();
         repaint();
         return;
     }
@@ -3883,6 +4534,45 @@ void MainComponent::buttonClicked (juce::Button* button)
         resized();
         repaint();
         return;
+    }
+
+    for (int strip = 0; strip < (int) mixerStrips.size(); ++strip)
+    {
+        if (button == &mixerMidiFxGuiButtons[(size_t) strip])
+        {
+            showPluginEditor (strip, PluginSlotKind::midiFx);
+            return;
+        }
+
+        if (button == &mixerInstrumentGuiButtons[(size_t) strip])
+        {
+            showPluginEditor (strip, PluginSlotKind::instrument);
+            return;
+        }
+
+        if (button == &mixerEffectAGuiButtons[(size_t) strip])
+        {
+            showPluginEditor (strip, PluginSlotKind::effectA);
+            return;
+        }
+
+        if (button == &mixerEffectBGuiButtons[(size_t) strip])
+        {
+            showPluginEditor (strip, PluginSlotKind::effectB);
+            return;
+        }
+
+        if (button == &mixerEffectCGuiButtons[(size_t) strip])
+        {
+            showPluginEditor (strip, PluginSlotKind::effectC);
+            return;
+        }
+
+        if (button == &mixerEffectDGuiButtons[(size_t) strip])
+        {
+            showPluginEditor (strip, PluginSlotKind::effectD);
+            return;
+        }
     }
 
     if (button == &saveButton)
@@ -3990,17 +4680,34 @@ void MainComponent::buttonClicked (juce::Button* button)
             if (button != slotButton)
                 continue;
 
-            activeFileChooser = std::make_unique<juce::FileChooser> ("Load Plugin",
-                                                                     juce::File::getSpecialLocation (juce::File::userHomeDirectory),
-                                                                     "*.component;*.vst3");
-            activeFileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
-                                            [this, strip, slotKind] (const juce::FileChooser& chooser)
-                                            {
-                                                const auto result = chooser.getResult();
-                                                activeFileChooser.reset();
-                                                if (result != juce::File())
-                                                    loadPluginIntoSlot (strip, slotKind, result);
-                                            });
+            auto choices = getPluginChoicesForSlot (slotKind);
+            juce::PopupMenu menu;
+            menu.addItem (1, "Empty");
+            menu.addSeparator();
+            for (int i = 0; i < choices.size(); ++i)
+                menu.addItem (100 + i, choices.getReference (i).name);
+
+            menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (slotButton),
+                                [this, strip, slotKind, choices] (int result)
+                                {
+                                    if (result <= 0)
+                                        return;
+
+                                    if (result == 1)
+                                    {
+                                        auto& slot = getHostedPluginSlot (strip, slotKind);
+                                        if (slot.instance != nullptr)
+                                            slot.instance->releaseResources();
+                                        slot = {};
+                                        slot.buttonText = "Empty";
+                                        updateMixerButtons();
+                                        return;
+                                    }
+
+                                    const auto choiceIndex = result - 100;
+                                    if (juce::isPositiveAndBelow (choiceIndex, choices.size()))
+                                        loadPluginIntoSlot (strip, slotKind, choices.getReference (choiceIndex));
+                                });
             return;
         }
     }
@@ -4402,6 +5109,10 @@ MainComponent::ScoreResult MainComponent::evaluateScoreForGrid (const juce::Arra
                         case GlyphType::chord:
                         case GlyphType::key:
                         case GlyphType::octave:
+                        case GlyphType::route:
+                        case GlyphType::channel:
+                        case GlyphType::cc:
+                        case GlyphType::parameter:
                         case GlyphType::tempo:
                         case GlyphType::ratchet:
                         case GlyphType::repeat:
@@ -4485,12 +5196,24 @@ void MainComponent::resetDrumVoices() noexcept
         voice = {};
 }
 
-void MainComponent::triggerSynthVoice (float midiNote, float amplitude, float noiseMix, float brightness, float waveformMix, float decayScale, int delaySamples) noexcept
+void MainComponent::triggerSynthVoice (float midiNote,
+                                       float amplitude,
+                                       float noiseMix,
+                                       float brightness,
+                                       float waveformMix,
+                                       float decayScale,
+                                       int delaySamples,
+                                       int preferredStrip,
+                                       int midiChannel,
+                                       float pitchBend,
+                                       float channelPressure,
+                                       int ccNumber,
+                                       int ccValue) noexcept
 {
     if (isPluginMode())
     {
         juce::ignoreUnused (noiseMix, brightness, waveformMix);
-        queuePluginNote (-1, midiNote, amplitude, decayScale, delaySamples);
+        queuePluginNote (preferredStrip, midiChannel, midiNote, amplitude, decayScale, delaySamples, pitchBend, channelPressure, ccNumber, ccValue);
         return;
     }
 
@@ -4537,14 +5260,24 @@ void MainComponent::triggerSynthVoice (float midiNote, float amplitude, float no
     voice->delaySamples = juce::jmax (0, delaySamples);
 }
 
-void MainComponent::triggerDrumVoice (DrumType type, float amplitude, float tone, float decayScale, int delaySamples) noexcept
+void MainComponent::triggerDrumVoice (DrumType type,
+                                      float amplitude,
+                                      float tone,
+                                      float decayScale,
+                                      int delaySamples,
+                                      int preferredStrip,
+                                      int midiChannel,
+                                      float pitchBend,
+                                      float channelPressure,
+                                      int ccNumber,
+                                      int ccValue) noexcept
 {
     if (isPluginMode())
     {
         const auto midiNote = type == DrumType::kick ? 36.0f
                             : (type == DrumType::snare ? 38.0f
                             : (type == DrumType::hat ? 42.0f : 39.0f));
-        queuePluginNote (2, midiNote, amplitude * juce::jmap (tone, 0.6f, 1.0f), decayScale * 0.5f, delaySamples);
+        queuePluginNote (preferredStrip, midiChannel, midiNote, amplitude * juce::jmap (tone, 0.6f, 1.0f), decayScale * 0.5f, delaySamples, pitchBend, channelPressure, ccNumber, ccValue);
         return;
     }
 
@@ -4621,6 +5354,13 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
             int localRatchet = 1;
             int localRepeat = 0;
             double localTempoMul = 1.0;
+            int localRoute = -1;
+            int localMidiChannel = 1;
+            int localCcNumber = -1;
+            int localCcValue = -1;
+            juce::String localParameterTarget;
+            float localPluginBend = 0.0f;
+            float localPluginPressure = 0.0f;
 
             while (juce::isPositiveAndBelow (col, cols)
                    && juce::isPositiveAndBelow (row, rows)
@@ -4656,6 +5396,22 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                         if (chainActive)
                             localKeyShift += 12.0 * std::round (value);
                         break;
+                    case GlyphType::route:
+                        if (chainActive)
+                            localRoute = juce::jlimit (0, 2, parseWholeNumberOrFallback (cell.code, (int) std::round (std::abs (value))) - 1);
+                        break;
+                    case GlyphType::channel:
+                        if (chainActive)
+                            localMidiChannel = juce::jlimit (1, 16, parseWholeNumberOrFallback (cell.code, (int) std::round (std::abs (value))));
+                        break;
+                    case GlyphType::cc:
+                        if (chainActive)
+                            parseCcSpec (cell.code, localCcNumber, localCcValue);
+                        break;
+                    case GlyphType::parameter:
+                        if (chainActive)
+                            localParameterTarget = cell.code.trim();
+                        break;
                     case GlyphType::tempo:
                         if (chainActive)
                             localTempoMul = juce::jlimit (0.5, 2.5, std::abs (value));
@@ -4674,7 +5430,10 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                         break;
                     case GlyphType::accent:
                         if (chainActive)
+                        {
                             localAmplitude *= juce::jlimit (0.4, 2.2, std::abs (value));
+                            localPluginPressure = juce::jlimit (0.0f, 1.0f, (float) (std::abs (value) / 2.2));
+                        }
                         break;
                     case GlyphType::decay:
                         if (chainActive)
@@ -4690,7 +5449,10 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                         break;
                     case GlyphType::bias:
                         if (chainActive)
+                        {
                             localPitch += value * 5.0;
+                            localPluginBend = juce::jlimit (-1.0f, 1.0f, (float) (value / 6.0));
+                        }
                         break;
                     case GlyphType::audio:
                         if (chainActive)
@@ -4718,6 +5480,8 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                                 {
                                     const auto repeatDelay = ratchetDelay + repeatIndex * repeatSpacing;
                                     const auto repeatAmp = ratchetAmp * std::pow (0.7f, (float) repeatIndex);
+                                    if (isPluginMode() && localParameterTarget.isNotEmpty())
+                                        applyPluginParameterTarget (localRoute, (float) basePitch, localParameterTarget, clamp01 ((float) std::abs (value)));
                                     for (int noteIndex = 0; noteIndex < chordSizes[(size_t) chordIndex]; ++noteIndex)
                                     {
                                         const auto interval = chordIntervals[(size_t) chordIndex][(size_t) noteIndex];
@@ -4727,7 +5491,13 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                                                           (float) localBrightness,
                                                           (float) localWaveformMix,
                                                           (float) localDecayScale,
-                                                          repeatDelay);
+                                                          repeatDelay,
+                                                          localRoute,
+                                                          localMidiChannel,
+                                                          localPluginBend,
+                                                          localPluginPressure,
+                                                          localCcNumber,
+                                                          localCcValue);
                                     }
                                 }
                             }
@@ -4750,7 +5520,13 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                                               (float) juce::jlimit (0.18, 0.62, localBrightness + 0.04 * melodicIndex),
                                               0.06f,
                                               (float) juce::jlimit (0.35, 1.4, localDecayScale * 0.55),
-                                              0);
+                                              0,
+                                              localRoute,
+                                              localMidiChannel,
+                                              localPluginBend,
+                                              localPluginPressure,
+                                              localCcNumber,
+                                              localCcValue);
                         }
                         break;
                     default:
@@ -4843,6 +5619,13 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
             int localRatchet = 1;
             int localRepeat = 0;
             int localSnakeLength = snake.length;
+            int localRoute = -1;
+            int localMidiChannel = 1;
+            int localCcNumber = -1;
+            int localCcValue = -1;
+            juce::String localParameterTarget;
+            float localPluginBend = 0.0f;
+            float localPluginPressure = 0.0f;
             auto chainActive = false;
 
             if (harmonySpaceMode)
@@ -4992,6 +5775,22 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                         if (chainReady)
                             localKeyShift += 12.0 * std::round (value);
                         break;
+                    case GlyphType::route:
+                        if (chainReady)
+                            localRoute = juce::jlimit (0, 2, parseWholeNumberOrFallback (cell.code, (int) std::round (std::abs (value))) - 1);
+                        break;
+                    case GlyphType::channel:
+                        if (chainReady)
+                            localMidiChannel = juce::jlimit (1, 16, parseWholeNumberOrFallback (cell.code, (int) std::round (std::abs (value))));
+                        break;
+                    case GlyphType::cc:
+                        if (chainReady)
+                            parseCcSpec (cell.code, localCcNumber, localCcValue);
+                        break;
+                    case GlyphType::parameter:
+                        if (chainReady)
+                            localParameterTarget = cell.code.trim();
+                        break;
                     case GlyphType::tempo:
                         if (chainReady)
                             localTempoMul = juce::jlimit (harmonySpaceMode ? 0.75 : 0.5, harmonySpaceMode ? 2.0 : 4.0, std::abs (value));
@@ -5017,7 +5816,10 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                         break;
                     case GlyphType::accent:
                         if (chainReady)
+                        {
                             localAmplitude *= juce::jlimit (0.35, harmonySpaceMode ? 1.8 : 2.8, std::abs (value));
+                            localPluginPressure = juce::jlimit (0.0f, 1.0f, (float) (std::abs (value) / (harmonySpaceMode ? 1.8 : 2.8)));
+                        }
                         break;
                     case GlyphType::decay:
                         if (chainReady)
@@ -5044,6 +5846,7 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                                 localPitch += value * (axisRole == 0 ? 7.0 : (axisRole == 1 ? 12.0 : 5.0));
                                 localBrightness = juce::jlimit (0.0, 1.0, localBrightness + value * (axisRole == 0 ? 0.18 : (axisRole == 1 ? 0.28 : 0.34)));
                             }
+                            localPluginBend = juce::jlimit (-1.0f, 1.0f, (float) (value / (harmonySpaceMode ? 4.0 : 8.0)));
                         }
                         break;
                     case GlyphType::audio:
@@ -5094,8 +5897,10 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
 
                                     for (int repeatIndex = 0; repeatIndex <= juce::jmin (localRepeat, axisRole == 0 ? 1 : 2); ++repeatIndex)
                                     {
-                                        const auto repeatDelay = ratchetDelay + repeatIndex * repeatSpacing;
-                                        const auto repeatAmp = ratchetAmp * std::pow (axisRole == 0 ? 0.58f : 0.66f, (float) repeatIndex);
+                                    const auto repeatDelay = ratchetDelay + repeatIndex * repeatSpacing;
+                                    const auto repeatAmp = ratchetAmp * std::pow (axisRole == 0 ? 0.58f : 0.66f, (float) repeatIndex);
+                                    if (isPluginMode() && localParameterTarget.isNotEmpty())
+                                        applyPluginParameterTarget (localRoute, (float) basePitch, localParameterTarget, clamp01 ((float) std::abs (value)));
 
                                         if (axisRole == 2)
                                         {
@@ -5116,7 +5921,13 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                                                                    voiceBrightness,
                                                                    voiceWaveform,
                                                                    voiceDecay,
-                                                                   repeatDelay + noteIndex * juce::jmax (0, samplesPerTick / 18));
+                                                                   repeatDelay + noteIndex * juce::jmax (0, samplesPerTick / 18),
+                                                                   localRoute,
+                                                                   localMidiChannel,
+                                                                   localPluginBend,
+                                                                   localPluginPressure,
+                                                                   localCcNumber,
+                                                                   localCcValue);
                                             }
                                         }
                                         else
@@ -5140,7 +5951,13 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                                                                    voiceBrightness,
                                                                    voiceWaveform,
                                                                    voiceDecay,
-                                                                   repeatDelay + noteIndex * juce::jmax (0, samplesPerTick / 18));
+                                                                   repeatDelay + noteIndex * juce::jmax (0, samplesPerTick / 18),
+                                                                   localRoute,
+                                                                   localMidiChannel,
+                                                                   localPluginBend,
+                                                                   localPluginPressure,
+                                                                   localCcNumber,
+                                                                   localCcValue);
                                             }
                                         }
                                     }
@@ -5178,7 +5995,13 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                                                               (float) localBrightness,
                                                               (float) localWaveformMix,
                                                               (float) localDecayScale,
-                                                              repeatDelay);
+                                                              repeatDelay,
+                                                              localRoute,
+                                                              localMidiChannel,
+                                                              localPluginBend,
+                                                              localPluginPressure,
+                                                              localCcNumber,
+                                                              localCcValue);
                                         }
                                     }
                                 }
@@ -5298,6 +6121,13 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
             auto localRepeat = 0;
             auto localDecay = 0.6;
             auto localAccent = 1.0;
+            auto localRoute = 2;
+            auto localMidiChannel = 10;
+            auto localCcNumber = -1;
+            auto localCcValue = -1;
+            juce::String localParameterTarget;
+            auto localPluginBend = 0.0f;
+            auto localPluginPressure = 0.0f;
 
             while (juce::isPositiveAndBelow (col, cols)
                    && juce::isPositiveAndBelow (row, rows)
@@ -5318,6 +6148,22 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                         if (chainReady)
                             localTempoMul = juce::jlimit (0.5, 4.0, std::abs (value));
                         break;
+                    case GlyphType::route:
+                        if (chainReady)
+                            localRoute = juce::jlimit (0, 2, parseWholeNumberOrFallback (cell.code, (int) std::round (std::abs (value))) - 1);
+                        break;
+                    case GlyphType::channel:
+                        if (chainReady)
+                            localMidiChannel = juce::jlimit (1, 16, parseWholeNumberOrFallback (cell.code, (int) std::round (std::abs (value))));
+                        break;
+                    case GlyphType::cc:
+                        if (chainReady)
+                            parseCcSpec (cell.code, localCcNumber, localCcValue);
+                        break;
+                    case GlyphType::parameter:
+                        if (chainReady)
+                            localParameterTarget = cell.code.trim();
+                        break;
                     case GlyphType::ratchet:
                         if (chainReady)
                             localRatchet = juce::jlimit (1, 8, (int) std::round (std::abs (value)));
@@ -5332,11 +6178,18 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                         break;
                     case GlyphType::accent:
                         if (chainReady)
+                        {
                             localAccent *= juce::jlimit (0.35, 2.4, std::abs (value));
+                            localPluginPressure = juce::jlimit (0.0f, 1.0f, (float) (std::abs (value) / 2.4));
+                        }
                         break;
                     case GlyphType::decay:
                         if (chainReady)
                             localDecay *= juce::jlimit (0.35, 2.2, std::abs (value));
+                        break;
+                    case GlyphType::bias:
+                        if (chainReady)
+                            localPluginBend = juce::jlimit (-1.0f, 1.0f, (float) (value / 8.0));
                         break;
                     case GlyphType::kick:
                     case GlyphType::snare:
@@ -5361,7 +6214,19 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                                 {
                                     const auto repeatDelay = ratchetDelay + repeatIndex * repeatSpacing;
                                     const auto repeatAmp = ratchetAmp * std::pow (0.7f, (float) repeatIndex);
-                                    triggerDrumVoice (drumType, repeatAmp, (float) juce::jlimit (0.0, 1.0, std::abs (value) * 0.25 + row / 8.0), (float) localDecay, repeatDelay);
+                                    if (isPluginMode() && localParameterTarget.isNotEmpty())
+                                        applyPluginParameterTarget (localRoute, (float) (36 + row), localParameterTarget, clamp01 ((float) std::abs (value)));
+                                    triggerDrumVoice (drumType,
+                                                      repeatAmp,
+                                                      (float) juce::jlimit (0.0, 1.0, std::abs (value) * 0.25 + row / 8.0),
+                                                      (float) localDecay,
+                                                      repeatDelay,
+                                                      localRoute,
+                                                      localMidiChannel,
+                                                      localPluginBend,
+                                                      localPluginPressure,
+                                                      localCcNumber,
+                                                      localCcValue);
                                 }
                             }
                         }
@@ -6134,11 +6999,17 @@ bool MainComponent::savePatchToFile (const juce::File& file)
         stripObject->setProperty ("volume", strip.volume);
         stripObject->setProperty ("pan", strip.pan);
         stripObject->setProperty ("midiFxPath", strip.midiFx.pluginPath);
+        stripObject->setProperty ("midiFxState", serialisePluginState (strip.midiFx));
         stripObject->setProperty ("instrumentPath", strip.instrument.pluginPath);
+        stripObject->setProperty ("instrumentState", serialisePluginState (strip.instrument));
         stripObject->setProperty ("effectAPath", strip.effectA.pluginPath);
+        stripObject->setProperty ("effectAState", serialisePluginState (strip.effectA));
         stripObject->setProperty ("effectBPath", strip.effectB.pluginPath);
+        stripObject->setProperty ("effectBState", serialisePluginState (strip.effectB));
         stripObject->setProperty ("effectCPath", strip.effectC.pluginPath);
+        stripObject->setProperty ("effectCState", serialisePluginState (strip.effectC));
         stripObject->setProperty ("effectDPath", strip.effectD.pluginPath);
+        stripObject->setProperty ("effectDState", serialisePluginState (strip.effectD));
         mixerStripsArray->add (juce::var (stripObject.release()));
     }
     root->setProperty ("mixerStrips", mixerStripsVar);
@@ -6285,7 +7156,7 @@ bool MainComponent::loadPatchFromFile (const juce::File& file)
     }
     sidebarToggleButton.setButtonText (isSidebarExpanded ? "Hide" : "...");
     toolValue.setText ("", juce::dontSendNotification);
-    bpmValue.setText ("BPM " + juce::String ((int) std::round (bpm)), juce::dontSendNotification);
+    updateTempoControl();
 
     if (auto* stripsArray = root->getProperty ("mixerStrips").getArray())
     {
@@ -6301,23 +7172,47 @@ bool MainComponent::loadPatchFromFile (const juce::File& file)
                 mixerStripLabels[(size_t) stripIndex].setText (mixerStrips[(size_t) stripIndex].name, juce::dontSendNotification);
 
                 const auto instrumentPath = stripObject->getProperty ("instrumentPath").toString();
+                const auto instrumentState = stripObject->getProperty ("instrumentState").toString();
                 const auto effectAPath = stripObject->getProperty ("effectAPath").toString();
+                const auto effectAState = stripObject->getProperty ("effectAState").toString();
                 const auto effectBPath = stripObject->getProperty ("effectBPath").toString();
+                const auto effectBState = stripObject->getProperty ("effectBState").toString();
                 const auto midiFxPath = stripObject->getProperty ("midiFxPath").toString();
+                const auto midiFxState = stripObject->getProperty ("midiFxState").toString();
                 const auto effectCPath = stripObject->getProperty ("effectCPath").toString();
+                const auto effectCState = stripObject->getProperty ("effectCState").toString();
                 const auto effectDPath = stripObject->getProperty ("effectDPath").toString();
+                const auto effectDState = stripObject->getProperty ("effectDState").toString();
                 if (midiFxPath.isNotEmpty())
+                {
                     loadPluginIntoSlot (stripIndex, PluginSlotKind::midiFx, juce::File (midiFxPath));
+                    restorePluginState (mixerStrips[(size_t) stripIndex].midiFx, midiFxState);
+                }
                 if (instrumentPath.isNotEmpty())
+                {
                     loadPluginIntoSlot (stripIndex, PluginSlotKind::instrument, juce::File (instrumentPath));
+                    restorePluginState (mixerStrips[(size_t) stripIndex].instrument, instrumentState);
+                }
                 if (effectAPath.isNotEmpty())
+                {
                     loadPluginIntoSlot (stripIndex, PluginSlotKind::effectA, juce::File (effectAPath));
+                    restorePluginState (mixerStrips[(size_t) stripIndex].effectA, effectAState);
+                }
                 if (effectBPath.isNotEmpty())
+                {
                     loadPluginIntoSlot (stripIndex, PluginSlotKind::effectB, juce::File (effectBPath));
+                    restorePluginState (mixerStrips[(size_t) stripIndex].effectB, effectBState);
+                }
                 if (effectCPath.isNotEmpty())
+                {
                     loadPluginIntoSlot (stripIndex, PluginSlotKind::effectC, juce::File (effectCPath));
+                    restorePluginState (mixerStrips[(size_t) stripIndex].effectC, effectCState);
+                }
                 if (effectDPath.isNotEmpty())
+                {
                     loadPluginIntoSlot (stripIndex, PluginSlotKind::effectD, juce::File (effectDPath));
+                    restorePluginState (mixerStrips[(size_t) stripIndex].effectD, effectDState);
+                }
             }
         }
     }
@@ -6359,6 +7254,10 @@ MainComponent::GlyphDefinition MainComponent::getGlyphDefinition (GlyphType type
         case GlyphType::chord:  return { "chord", "Ch", juce::Colour (0xff4bf0ff), "2" };
         case GlyphType::key:    return { "key", "Ky", juce::Colour (0xff4dffb2), "0" };
         case GlyphType::octave: return { "octave", "Oc", juce::Colour (0xff7fe0ff), "1" };
+        case GlyphType::route:  return { "route", "Ro", juce::Colour (0xff8ef1ff), "1" };
+        case GlyphType::channel:return { "channel", "Cn", juce::Colour (0xff56b7ff), "1" };
+        case GlyphType::cc:     return { "cc", "CC", juce::Colour (0xff8dffdd), "1=96" };
+        case GlyphType::parameter: return { "param", "Pm", juce::Colour (0xffffdb7d), "cutoff=0.72" };
         case GlyphType::tempo:  return { "tempo", "Tp", juce::Colour (0xffffa64d), "1.5" };
         case GlyphType::ratchet:return { "ratchet", "Rt", juce::Colour (0xffff6b6b), "3" };
         case GlyphType::repeat: return { "repeat", "Rp", juce::Colour (0xffff8cff), "2" };
@@ -6447,6 +7346,10 @@ MainComponent::GlyphType MainComponent::toolIdToGlyph (const juce::String& id)
     if (id == "chord")   return GlyphType::chord;
     if (id == "key")     return GlyphType::key;
     if (id == "octave")  return GlyphType::octave;
+    if (id == "route")   return GlyphType::route;
+    if (id == "channel") return GlyphType::channel;
+    if (id == "cc")      return GlyphType::cc;
+    if (id == "param")   return GlyphType::parameter;
     if (id == "tempo")   return GlyphType::tempo;
     if (id == "ratchet") return GlyphType::ratchet;
     if (id == "repeat")  return GlyphType::repeat;
@@ -6476,6 +7379,10 @@ juce::Colour MainComponent::hiddenBadgeColour (GlyphType type) noexcept
         case GlyphType::chord:
         case GlyphType::key:
         case GlyphType::octave:
+        case GlyphType::route:
+        case GlyphType::channel:
+        case GlyphType::cc:
+        case GlyphType::parameter:
             return juce::Colour (0xff4dd9ff);
         case GlyphType::tempo:
         case GlyphType::ratchet:

@@ -58,6 +58,10 @@ private:
         chord,
         key,
         octave,
+        route,
+        channel,
+        cc,
+        parameter,
         tempo,
         ratchet,
         repeat,
@@ -277,6 +281,7 @@ private:
         juce::AudioBuffer<float> midiFxScratchBuffer;
         juce::MidiBuffer midiBuffer;
         std::vector<ScheduledMidiEvent> pendingMidi;
+        std::unique_ptr<juce::DocumentWindow> pluginWindow;
     };
 
     class SidebarButton final : public juce::TextButton
@@ -373,6 +378,62 @@ private:
         juce::Colour accentColour;
     };
 
+    class MeterSlider final : public juce::Slider
+    {
+    public:
+        MeterSlider() = default;
+
+        void setAccentColour (juce::Colour colour) noexcept { accentColour = colour; }
+        void setMeterLevel (float level) noexcept
+        {
+            const auto clamped = juce::jlimit (0.0f, 1.0f, level);
+            if (std::abs (clamped - meterLevel) > 0.002f)
+            {
+                meterLevel = clamped;
+                repaint();
+            }
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            auto bounds = getLocalBounds().toFloat();
+            auto track = bounds.reduced (10.0f, 8.0f);
+            track.removeFromBottom (22.0f);
+
+            g.setColour (juce::Colour::fromFloatRGBA (0.05f, 0.08f, 0.10f, 0.96f));
+            g.fillRoundedRectangle (track, 10.0f);
+
+            g.setColour (juce::Colours::white.withAlpha (0.10f));
+            g.drawRoundedRectangle (track.reduced (0.5f), 10.0f, 1.0f);
+
+            const auto clampedMeter = juce::jlimit (0.0f, 1.0f, meterLevel);
+            auto meterFill = track.withTop (juce::jmap (1.0f - clampedMeter, track.getY(), track.getBottom()));
+            juce::ColourGradient meterGradient (accentColour.withAlpha (0.92f),
+                                                meterFill.getCentreX(), meterFill.getBottom(),
+                                                juce::Colours::white.withAlpha (0.95f),
+                                                meterFill.getCentreX(), meterFill.getY(),
+                                                false);
+            meterGradient.addColour (0.55, accentColour.brighter (0.35f).withAlpha (0.86f));
+            g.setGradientFill (meterGradient);
+            g.fillRoundedRectangle (meterFill.reduced (2.5f, 2.0f), 8.0f);
+
+            const auto normalizedValue = (float) juce::jmap (getValue(), getMinimum(), getMaximum(), 0.0, 1.0);
+            const auto thumbY = juce::jmap (1.0f - normalizedValue, track.getY() + 8.0f, track.getBottom() - 8.0f);
+            auto thumb = juce::Rectangle<float> (track.getX() - 1.0f, thumbY - 7.0f, track.getWidth() + 2.0f, 14.0f);
+
+            g.setColour (accentColour.withAlpha (0.18f));
+            g.fillRoundedRectangle (thumb.expanded (1.5f, 2.0f), 8.0f);
+            g.setColour (juce::Colour::fromFloatRGBA (0.14f, 0.20f, 0.22f, 0.95f));
+            g.fillRoundedRectangle (thumb, 7.0f);
+            g.setColour (accentColour.withAlpha (0.95f));
+            g.drawRoundedRectangle (thumb.reduced (0.6f), 7.0f, 1.4f);
+        }
+
+    private:
+        juce::Colour accentColour = juce::Colour::fromFloatRGBA (0.22f, 1.0f, 0.68f, 1.0f);
+        float meterLevel = 0.0f;
+    };
+
     class CellButton final : public juce::Button
     {
     public:
@@ -438,6 +499,7 @@ private:
     void initialiseGrid (AppMode mode);
     void applyMode (AppMode mode, ModeVariant variant, bool showTitleAfter = false);
     void createUi();
+    void updateTempoControl();
     void layoutSidebar (juce::Rectangle<int>);
     void layoutMainArea (juce::Rectangle<int>);
     void layoutInspector (juce::Rectangle<int>);
@@ -468,20 +530,61 @@ private:
     void resetSynthVoices() noexcept;
     void resetDrumVoices() noexcept;
     void processAudioTick (const PatchSnapshot& snapshot, double timeSeconds) noexcept;
-    void triggerSynthVoice (float midiNote, float amplitude, float noiseMix, float brightness, float waveformMix, float decayScale, int delaySamples = 0) noexcept;
-    void triggerDrumVoice (DrumType type, float amplitude, float tone, float decayScale, int delaySamples = 0) noexcept;
+    void triggerSynthVoice (float midiNote,
+                            float amplitude,
+                            float noiseMix,
+                            float brightness,
+                            float waveformMix,
+                            float decayScale,
+                            int delaySamples = 0,
+                            int preferredStrip = -1,
+                            int midiChannel = 1,
+                            float pitchBend = 0.0f,
+                            float channelPressure = 0.0f,
+                            int ccNumber = -1,
+                            int ccValue = -1) noexcept;
+    void triggerDrumVoice (DrumType type,
+                           float amplitude,
+                           float tone,
+                           float decayScale,
+                           int delaySamples = 0,
+                           int preferredStrip = 2,
+                           int midiChannel = 10,
+                           float pitchBend = 0.0f,
+                           float channelPressure = 0.0f,
+                           int ccNumber = -1,
+                           int ccValue = -1) noexcept;
     float renderSynthSample() noexcept;
     float renderDrumSample() noexcept;
     void initialisePluginHosting();
     void clearPluginProcessingState() noexcept;
     void preparePluginInstances (double sampleRate, int blockSize);
     void releasePluginInstances();
+    void loadCachedOrScanPluginDescriptions();
+    juce::File getPluginCacheFile() const;
+    void savePluginCache() const;
+    bool loadPluginCache();
+    void scanLogicPluginFolders();
     bool loadPluginIntoSlot (int stripIndex, PluginSlotKind slotKind, const juce::File& file);
+    bool loadPluginIntoSlot (int stripIndex, PluginSlotKind slotKind, const juce::PluginDescription& description);
+    static juce::String serialisePluginState (const HostedPluginSlot& slot);
+    static void restorePluginState (HostedPluginSlot& slot, const juce::String& encodedState);
     HostedPluginSlot& getHostedPluginSlot (int stripIndex, PluginSlotKind slotKind) noexcept;
     const HostedPluginSlot& getHostedPluginSlot (int stripIndex, PluginSlotKind slotKind) const noexcept;
     void updateMixerButtons();
-    void queuePluginNote (int preferredStrip, float midiNote, float amplitude, float decayScale, int delaySamples) noexcept;
+    void showPluginEditor (int stripIndex, PluginSlotKind slotKind);
+    void queuePluginNote (int preferredStrip,
+                          int midiChannel,
+                          float midiNote,
+                          float amplitude,
+                          float decayScale,
+                          int delaySamples,
+                          float pitchBend = 0.0f,
+                          float channelPressure = 0.0f,
+                          int ccNumber = -1,
+                          int ccValue = -1) noexcept;
     void queuePluginMessage (int stripIndex, const juce::MidiMessage& message, int absoluteSampleOffset) noexcept;
+    void applyPluginParameterTarget (int preferredStrip, float midiNote, const juce::String& targetSpec, float fallbackNormalized) noexcept;
     void flushPendingPluginEventsForBlock (int blockSize) noexcept;
     void processPluginBlock (const juce::AudioSourceChannelInfo& bufferToFill,
                              const PatchSnapshot& snapshot,
@@ -491,6 +594,9 @@ private:
     ModeVariant getModeVariantForCurrentSession() const noexcept;
     static juce::String modeVariantToString (ModeVariant);
     static ModeVariant stringToModeVariant (const juce::String&);
+    static bool isMidiFxPlugin (const juce::PluginDescription&) noexcept;
+    static bool isInstrumentPlugin (const juce::PluginDescription&) noexcept;
+    juce::Array<juce::PluginDescription> getPluginChoicesForSlot (PluginSlotKind) const;
     void initialiseSnakes();
     void spawnSnake();
     void advanceSnakesToTick (int targetTick, const PatchSnapshot& snapshot);
@@ -537,6 +643,7 @@ private:
     juce::TextButton sidebarToggleButton { "..." };
     FooterButton a1ModeButton { "A1", juce::Colour::fromFloatRGBA (0.12f, 0.96f, 1.0f, 1.0f) },
                  resumeModeButton { "Resume", juce::Colour::fromFloatRGBA (0.92f, 1.0f, 0.28f, 1.0f) },
+                 rescanPluginsButton { "Rescan Plugins", juce::Colour::fromFloatRGBA (1.0f, 0.62f, 0.18f, 1.0f) },
                  a2ModeButton { "A2", juce::Colour::fromFloatRGBA (0.78f, 1.0f, 0.22f, 1.0f) },
                  a3ModeButton { "A3", juce::Colour::fromFloatRGBA (1.0f, 0.26f, 0.82f, 1.0f) },
                  a4ModeButton { "A4", juce::Colour::fromFloatRGBA (1.0f, 0.84f, 0.22f, 1.0f) },
@@ -545,18 +652,26 @@ private:
                  b3ModeButton { "B3", juce::Colour::fromFloatRGBA (1.0f, 0.48f, 0.96f, 1.0f) },
                  b4ModeButton { "B4", juce::Colour::fromFloatRGBA (1.0f, 0.94f, 0.36f, 1.0f) };
     juce::Label patchTitle, scoreLabel, stepLabel, bpmValue, beatValue, toolValue, audioValue, inspectorTitle, layerValue;
+    juce::Label tempoControlLabel;
+    juce::Slider tempoSlider;
     juce::TextEditor labelEditor, codeEditor;
     juce::Label glyphValueLabel;
     juce::Label helpLabel;
     juce::TextButton eraseButton { "Erase Cell" };
     std::array<juce::Label, 3> mixerStripLabels;
     std::array<juce::TextButton, 3> mixerMidiFxButtons;
+    std::array<juce::TextButton, 3> mixerMidiFxGuiButtons;
     std::array<juce::TextButton, 3> mixerInstrumentButtons;
+    std::array<juce::TextButton, 3> mixerInstrumentGuiButtons;
     std::array<juce::TextButton, 3> mixerEffectAButtons;
+    std::array<juce::TextButton, 3> mixerEffectAGuiButtons;
     std::array<juce::TextButton, 3> mixerEffectBButtons;
+    std::array<juce::TextButton, 3> mixerEffectBGuiButtons;
     std::array<juce::TextButton, 3> mixerEffectCButtons;
+    std::array<juce::TextButton, 3> mixerEffectCGuiButtons;
     std::array<juce::TextButton, 3> mixerEffectDButtons;
-    std::array<juce::Slider, 3> mixerVolumeSliders;
+    std::array<juce::TextButton, 3> mixerEffectDGuiButtons;
+    std::array<MeterSlider, 3> mixerVolumeSliders;
     std::array<juce::Slider, 3> mixerPanSliders;
     std::array<juce::Label, 3> mixerVolumeLabels;
     std::array<juce::Label, 3> mixerPanLabels;
@@ -596,6 +711,7 @@ private:
     std::atomic<int> pendingSpawnRequests { 0 };
     std::atomic<bool> pendingSnakeReset { false };
     std::atomic<float> publishedTransportPhase { 0.0f };
+    std::array<std::atomic<float>, 3> publishedMixerLevels {};
     std::atomic<uint64_t> transportSequence { 0 };
     ScoreResult lastScore;
     std::shared_ptr<const PatchSnapshot> currentPatchSnapshot;
@@ -606,6 +722,7 @@ private:
     std::array<DrumVoice, maxDrumVoices> drumVoices {};
     std::array<MixerStripState, 3> mixerStrips {};
     juce::AudioPluginFormatManager pluginFormatManager;
+    juce::Array<juce::PluginDescription> cachedPluginDescriptions;
     int audioSnakeCount = 0;
     int currentPluginBlockSize = 512;
     int currentAudioBlockSampleOffset = 0;
