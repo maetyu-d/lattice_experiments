@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ribbon Prototype</title>
+    <link rel="stylesheet" href="./ribbon.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <section class="sidebar-section">
+          <div class="section-label">Concepts</div>
+          <a class="nav-link" href="./index.html">PulsePatch</a>
+          <a class="nav-link" href="./glyphgrid.html">GlyphGrid</a>
+          <a class="nav-link active" href="./ribbon.html">Ribbon</a>
+        </section>
+        <section class="sidebar-section">
+          <div class="section-label">Processors</div>
+          <div id="processor-palette" class="tool-palette"></div>
+        </section>
+        <section class="sidebar-section">
+          <div class="section-label">Hints</div>
+          <p class="hint-text">Select a lane, add processors, and drag them horizontally. Each ribbon is evaluated left to right, with inline code shaping the flow.</p>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <section class="ribbon-panel">
+          <div class="panel-header">
+            <div>
+              <div class="section-label">Flow</div>
+              <h1>Ribbon</h1>
+            </div>
+            <div class="status-group">
+              <span id="lane-readout">Lane 1</span>
+            </div>
+          </div>
+          <div id="ribbon-canvas" class="ribbon-canvas">
+            <svg id="ribbon-svg" viewBox="0 0 1200 720" preserveAspectRatio="none"></svg>
+          </div>
+        </section>
+
+        <aside class="right-panel">
+          <section class="preview-panel">
+            <div class="panel-header tight">
+              <div>
+                <div class="section-label">Stage</div>
+                <h2>Signal Choreography</h2>
+              </div>
+              <div class="status-chip" id="fps-chip">FPS 0</div>
+            </div>
+            <canvas id="stage" width="640" height="360"></canvas>
+          </section>
+
+          <section class="inspector-panel">
+            <div class="panel-header tight">
+              <div>
+                <div class="section-label">Inspector</div>
+                <h2 id="inspector-title">Select a processor</h2>
+              </div>
+            </div>
+            <div id="inspector-body" class="inspector-body empty-state">
+              Select a lane or processor to edit it.
+            </div>
+          </section>
+        </aside>
+      </main>
+
+      <footer class="transport-bar">
+        <div class="transport-controls">
+          <button id="play-toggle" class="transport-button">Play</button>
+          <button id="reset-button" class="transport-button secondary">Reset Lanes</button>
+        </div>
+        <div class="transport-readouts">
+          <div class="readout"><span class="readout-label">BPM</span><span id="bpm-readout">112</span></div>
+          <div class="readout"><span class="readout-label">Beat</span><span id="beat-readout">0.00</span></div>
+          <div class="readout"><span class="readout-label">Lane</span><span id="lane-readout-bottom">1</span></div>
+          <div class="readout"><span class="readout-label">Audio</span><span id="audio-readout">stopped</span></div>
+        </div>
+      </footer>
+    </div>
+
+    <script type="module" src="./ribbon.js"></script>
+  </body>
+</html>

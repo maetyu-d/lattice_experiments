@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PulsePatch Prototype</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="left-rail">
+        <div class="rail-section">
+          <div class="section-label">Concepts</div>
+          <a class="library-item nav-link" href="./index.html">PulsePatch</a>
+          <a class="library-item nav-link" href="./glyphgrid.html">GlyphGrid</a>
+          <a class="library-item nav-link" href="./ribbon.html">Ribbon</a>
+        </div>
+        <div class="rail-section">
+          <div class="section-label">Library</div>
+          <button class="library-item" data-node-type="clock">Clock</button>
+          <button class="library-item" data-node-type="lfo">LFO</button>
+          <button class="library-item" data-node-type="osc">Osc</button>
+          <button class="library-item" data-node-type="noise">Noise</button>
+          <button class="library-item" data-node-type="env">Env</button>
+          <button class="library-item" data-node-type="filter">Filter</button>
+          <button class="library-item" data-node-type="amp">Amp</button>
+          <button class="library-item" data-node-type="mixer">Mixer</button>
+          <button class="library-item" data-node-type="bytebeat">Bytebeat</button>
+          <button class="library-item" data-node-type="visual">MinimalViz</button>
+          <button class="library-item" data-node-type="output">Output</button>
+        </div>
+        <div class="rail-section">
+          <div class="section-label">Hints</div>
+          <p class="hint-text">Click an output port, then an input or <code>mod</code> param port to patch a cable. Shift-click a port to clear its connections. Press play to start audio.</p>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <section class="canvas-panel">
+          <div class="panel-header">
+            <div>
+              <div class="section-label">Patch</div>
+              <h1>PulsePatch</h1>
+            </div>
+            <div class="status-group">
+              <span id="connection-status">4 nodes / 4 cables</span>
+            </div>
+          </div>
+          <div id="patch-canvas" class="patch-canvas">
+            <svg id="cable-layer" class="cable-layer"></svg>
+          </div>
+        </section>
+
+        <aside class="right-panel">
+          <section class="preview-panel">
+            <div class="panel-header tight">
+              <div>
+                <div class="section-label">Main Out</div>
+                <h2>Visual Stage</h2>
+              </div>
+              <div class="status-chip" id="fps-chip">FPS 0</div>
+            </div>
+            <canvas id="stage" width="640" height="360"></canvas>
+          </section>
+
+          <section class="inspector-panel">
+            <div class="panel-header tight">
+              <div>
+                <div class="section-label">Inspector</div>
+                <h2 id="inspector-title">Select a node</h2>
+              </div>
+            </div>
+            <div id="inspector-body" class="inspector-body empty-state">
+              Click a node to edit its ports, parameters, and code.
+            </div>
+          </section>
+        </aside>
+      </main>
+
+      <footer class="transport-bar">
+        <div class="transport-controls">
+          <button id="play-toggle" class="transport-button">Play</button>
+          <button id="reset-button" class="transport-button secondary">Reset</button>
+        </div>
+        <div class="transport-readouts">
+          <div class="readout"><span class="readout-label">BPM</span><span id="bpm-readout">120</span></div>
+          <div class="readout"><span class="readout-label">Beat</span><span id="beat-readout">0.00</span></div>
+          <div class="readout"><span class="readout-label">CPU</span><span id="cpu-readout">idle</span></div>
+          <div class="readout"><span class="readout-label">Audio</span><span id="audio-readout">stopped</span></div>
+        </div>
+      </footer>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GlyphGrid Prototype</title>
+    <link rel="stylesheet" href="./glyphgrid.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <section class="sidebar-section">
+          <div class="section-label">Concepts</div>
+          <a class="nav-link" href="./index.html">PulsePatch</a>
+          <a class="nav-link active" href="./glyphgrid.html">GlyphGrid</a>
+          <a class="nav-link" href="./ribbon.html">Ribbon</a>
+        </section>
+        <section class="sidebar-section">
+          <div class="section-label">Glyphs</div>
+          <div id="tool-palette" class="tool-palette"></div>
+        </section>
+        <section class="sidebar-section">
+          <div class="section-label">Hints</div>
+          <p class="hint-text">Choose a glyph, click cells to stamp it into the score, then edit the selected cell's expression. Each row scans left to right and writes into audio or visuals.</p>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <section class="grid-panel">
+          <div class="panel-header">
+            <div>
+              <div class="section-label">Score</div>
+              <h1>GlyphGrid</h1>
+            </div>
+            <div class="status-group">
+              <span id="column-readout">Step 0</span>
+            </div>
+          </div>
+          <div id="grid" class="grid"></div>
+        </section>
+
+        <aside class="right-panel">
+          <section class="preview-panel">
+            <div class="panel-header tight">
+              <div>
+                <div class="section-label">Stage</div>
+                <h2>Signal Score</h2>
+              </div>
+              <div class="status-chip" id="fps-chip">FPS 0</div>
+            </div>
+            <canvas id="stage" width="640" height="360"></canvas>
+          </section>
+
+          <section class="inspector-panel">
+            <div class="panel-header tight">
+              <div>
+                <div class="section-label">Inspector</div>
+                <h2 id="inspector-title">Select a cell</h2>
+              </div>
+            </div>
+            <div id="inspector-body" class="inspector-body empty-state">
+              Click a grid cell to edit its label and expression.
+            </div>
+          </section>
+        </aside>
+      </main>
+
+      <footer class="transport-bar">
+        <div class="transport-controls">
+          <button id="play-toggle" class="transport-button">Play</button>
+          <button id="clear-button" class="transport-button secondary">Clear Grid</button>
+        </div>
+        <div class="transport-readouts">
+          <div class="readout"><span class="readout-label">BPM</span><span id="bpm-readout">108</span></div>
+          <div class="readout"><span class="readout-label">Beat</span><span id="beat-readout">0.00</span></div>
+          <div class="readout"><span class="readout-label">Tool</span><span id="tool-readout">tone</span></div>
+          <div class="readout"><span class="readout-label">Audio</span><span id="audio-readout">stopped</span></div>
+        </div>
+      </footer>
+    </div>
+
+    <script type="module" src="./glyphgrid.js"></script>
+  </body>
+</html>
