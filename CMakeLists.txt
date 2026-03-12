@@ -33,11 +33,14 @@ target_sources(GlyphGridJUCE PRIVATE
 target_compile_definitions(GlyphGridJUCE PRIVATE
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
+    JUCE_PLUGINHOST_VST3=1
+    JUCE_PLUGINHOST_AU=1
 )
 
 target_link_libraries(GlyphGridJUCE PRIVATE
     juce::juce_gui_extra
     juce::juce_audio_utils
+    juce::juce_audio_processors
 )
 
 juce_generate_juce_header(GlyphGridJUCE)
