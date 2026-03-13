@@ -64,6 +64,64 @@ int parseWholeNumberOrFallback (const juce::String& text, int fallback) noexcept
     const auto trimmed = text.trim();
     return trimmed.isEmpty() ? fallback : trimmed.getIntValue();
 }
+juce::String cellularRuleName (MainComponent::CellularRule rule)
+{
+    switch (rule)
+    {
+        case MainComponent::CellularRule::bloom: return "Bloom";
+        case MainComponent::CellularRule::maze:  return "Maze";
+        case MainComponent::CellularRule::coral: return "Coral";
+        case MainComponent::CellularRule::pulse: return "Pulse";
+    }
+
+    return "Bloom";
+}
+juce::String cellularRangeLabel (juce::String prefix, MainComponent::CellularRuleRange range)
+{
+    return prefix + " " + juce::String (range.min) + "-" + juce::String (range.max);
+}
+int modeIndex (MainComponent::AppMode mode) noexcept
+{
+    switch (mode)
+    {
+        case MainComponent::AppMode::glyphGrid: return 0;
+        case MainComponent::AppMode::cellularGrid: return 1;
+        case MainComponent::AppMode::harmonicGeometry: return 2;
+        case MainComponent::AppMode::harmonySpace: return 3;
+    }
+    return 0;
+}
+int wrapPitchClass (int pc) noexcept
+{
+    auto wrapped = pc % 12;
+    if (wrapped < 0)
+        wrapped += 12;
+    return wrapped;
+}
+float snapMidiToPitchClasses (float midiNote, const juce::Array<int>& pitchClasses) noexcept
+{
+    if (pitchClasses.isEmpty())
+        return midiNote;
+
+    auto bestNote = midiNote;
+    auto bestDistance = std::numeric_limits<float>::max();
+    const auto rounded = (int) std::round (midiNote);
+
+    for (int candidate = rounded - 12; candidate <= rounded + 12; ++candidate)
+    {
+        if (! pitchClasses.contains (wrapPitchClass (candidate)))
+            continue;
+
+        const auto distance = std::abs ((float) candidate - midiNote);
+        if (distance < bestDistance)
+        {
+            bestDistance = distance;
+            bestNote = (float) candidate;
+        }
+    }
+
+    return bestNote;
+}
 bool parseCcSpec (const juce::String& text, int& ccNumber, int& ccValue) noexcept
 {
     const auto parts = juce::StringArray::fromTokens (text.trim(), "=,: ", "");
@@ -75,6 +133,7 @@ bool parseCcSpec (const juce::String& text, int& ccNumber, int& ccValue) noexcep
     return true;
 }
 bool parseParameterSpec (const juce::String& text,
+                         int& explicitStripIndex,
                          juce::String& slotQualifier,
                          juce::String& parameterToken,
                          float& normalizedValue,
@@ -84,6 +143,7 @@ bool parseParameterSpec (const juce::String& text,
     if (spec.isEmpty())
         return false;
 
+    explicitStripIndex = -1;
     slotQualifier.clear();
     parameterToken.clear();
     normalizedValue = 0.0f;
@@ -97,14 +157,35 @@ bool parseParameterSpec (const juce::String& text,
         hasExplicitValue = true;
     }
 
-    if (const auto colonIndex = target.indexOfChar (':'); colonIndex >= 0)
+    auto remainder = target;
+    if (const auto colonIndex = remainder.indexOfChar (':'); colonIndex >= 0)
     {
-        slotQualifier = target.substring (0, colonIndex).trim().toLowerCase();
-        parameterToken = target.substring (colonIndex + 1).trim();
+        auto firstToken = remainder.substring (0, colonIndex).trim().toLowerCase();
+        remainder = remainder.substring (colonIndex + 1).trim();
+
+        if (firstToken.startsWithChar ('s') && firstToken.substring (1).containsOnly ("0123456789"))
+        {
+            explicitStripIndex = juce::jlimit (0, 2, firstToken.substring (1).getIntValue() - 1);
+
+            if (const auto secondColonIndex = remainder.indexOfChar (':'); secondColonIndex >= 0)
+            {
+                slotQualifier = remainder.substring (0, secondColonIndex).trim().toLowerCase();
+                parameterToken = remainder.substring (secondColonIndex + 1).trim();
+            }
+            else
+            {
+                parameterToken = remainder.trim();
+            }
+        }
+        else
+        {
+            slotQualifier = firstToken;
+            parameterToken = remainder.trim();
+        }
     }
     else
     {
-        parameterToken = target.trim();
+        parameterToken = remainder.trim();
     }
 
     return parameterToken.isNotEmpty();
@@ -185,6 +266,8 @@ void MainComponent::CellButton::paintButton (juce::Graphics& g, bool over, bool)
     auto area = getLocalBounds().toFloat();
     auto def = MainComponent::getGlyphDefinition (type);
     auto fill = def.colour.withAlpha (type == GlyphType::empty ? (hasAnyLayerContent ? 0.13f : 0.08f) : 0.18f);
+    if (isSnakeHead)
+        fill = fill.interpolatedWith (snakeColour.withAlpha (0.42f), 0.34f);
 
     if (over)
         fill = fill.brighter (0.12f);
@@ -228,6 +311,16 @@ void MainComponent::CellButton::paintButton (juce::Graphics& g, bool over, bool)
         g.drawRoundedRectangle (automataBox.reduced (0.5f), 10.0f, isAutomataNewborn ? 1.8f : 1.1f);
     }
 
+    if (pluginActivity > 0.001f)
+    {
+        auto pluginBox = area.reduced (3.5f);
+        const auto pluginGlow = juce::Colour::fromFloatRGBA (0.18f, 0.98f, 1.0f, 1.0f);
+        g.setColour (pluginGlow.withAlpha (0.10f + pluginActivity * 0.22f));
+        g.fillRoundedRectangle (pluginBox, 11.0f);
+        g.setColour (pluginGlow.withAlpha (0.34f + pluginActivity * 0.46f));
+        g.drawRoundedRectangle (pluginBox.reduced (0.5f), 11.0f, 1.1f + pluginActivity * 0.8f);
+    }
+
     if (showsNextStep)
     {
         auto nextBox = area.reduced (6.0f, 6.0f);
@@ -235,6 +328,15 @@ void MainComponent::CellButton::paintButton (juce::Graphics& g, bool over, bool)
         g.fillRoundedRectangle (nextBox, 9.0f);
         g.setColour (snakeColour.withAlpha (0.58f));
         g.drawRoundedRectangle (nextBox.reduced (0.5f), 9.0f, 1.2f);
+    }
+
+    if (isSnakeHead)
+    {
+        auto headHalo = area.reduced (2.5f);
+        g.setColour (snakeColour.withAlpha (0.16f));
+        g.fillRoundedRectangle (headHalo, 12.0f);
+        g.setColour (snakeColour.withAlpha (0.88f));
+        g.drawRoundedRectangle (headHalo.reduced (0.5f), 12.0f, 1.8f);
     }
 
     g.setColour (juce::Colours::white.withAlpha (isSelected ? 0.36f : (isActiveColumn ? 0.18f : 0.10f)));
@@ -255,6 +357,28 @@ void MainComponent::CellButton::paintButton (juce::Graphics& g, bool over, bool)
                       getLocalBounds().reduced (8).withTrimmedTop (18),
                       juce::Justification::centredLeft,
                       2);
+
+    if (! overlayBadges.isEmpty())
+    {
+        auto badgeArea = getLocalBounds().reduced (8, 7).removeFromRight (72);
+        badgeArea = badgeArea.removeFromTop (18);
+
+        for (int badgeIndex = 0; badgeIndex < overlayBadges.size(); ++badgeIndex)
+        {
+            auto pillBounds = badgeArea.removeFromRight (juce::jmin (36, 12 + overlayBadges[badgeIndex].length() * 7));
+            badgeArea.removeFromRight (4);
+
+            const auto pill = pillBounds.toFloat();
+            const auto badgeColour = overlayBadgeColours[badgeIndex];
+            g.setColour (badgeColour.withAlpha (0.20f));
+            g.fillRoundedRectangle (pill, 7.0f);
+            g.setColour (badgeColour.withAlpha (0.88f));
+            g.drawRoundedRectangle (pill.reduced (0.5f), 7.0f, 1.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.94f));
+            g.setFont (juce::FontOptions (9.5f, juce::Font::bold));
+            g.drawFittedText (overlayBadges[badgeIndex], pillBounds, juce::Justification::centred, 1);
+        }
+    }
 
     if (isSnakeHead && ! isGhostSnake && (snakeDirectionX != 0 || snakeDirectionY != 0 || snakeDirectionLayer != 0))
     {
@@ -1055,6 +1179,37 @@ void MainComponent::StageComponent::paint (juce::Graphics& g)
         g.setGradientFill (stageBloom);
         g.fillRoundedRectangle (stageBounds.reduced (1.0f), 16.0f);
 
+        if (isCellularMode)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.84f));
+            g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
+            g.drawFittedText ("CA " + cellularRuleName ((MainComponent::CellularRule) result.cellularRule),
+                              stageBounds.removeFromTop (18).removeFromLeft (120).toNearestInt(),
+                              juce::Justification::centredLeft,
+                              1);
+        }
+
+        if (result.pluginMode)
+        {
+            auto meterArea = juce::Rectangle<float> (stageBounds.getRight() - 28.0f, stageBounds.getY() + 28.0f, 12.0f, stageBounds.getHeight() - 56.0f);
+            const std::array<juce::Colour, 3> meterColours {
+                juce::Colour::fromFloatRGBA (0.98f, 0.86f, 0.22f, 1.0f),
+                juce::Colour::fromFloatRGBA (0.14f, 0.96f, 1.0f, 1.0f),
+                juce::Colour::fromFloatRGBA (1.0f, 0.30f, 0.86f, 1.0f)
+            };
+
+            for (int i = 0; i < 3; ++i)
+            {
+                auto bar = meterArea.removeFromLeft (3.0f);
+                meterArea.removeFromLeft (2.0f);
+                g.setColour (juce::Colours::white.withAlpha (0.06f));
+                g.fillRoundedRectangle (bar, 2.0f);
+                const auto filled = bar.withY (bar.getBottom() - bar.getHeight() * juce::jlimit (0.0f, 1.0f, result.mixerLevels[(size_t) i]));
+                g.setColour (meterColours[(size_t) i].withAlpha (0.82f));
+                g.fillRoundedRectangle (filled, 2.0f);
+            }
+        }
+
         const auto isoX = isHarmonicMode
                               ? juce::Point<float> (stageBounds.getWidth() * 0.028f, -stageBounds.getHeight() * 0.006f)
                               : (isHarmonySpaceMode ? juce::Point<float> (stageBounds.getWidth() * 0.026f, -stageBounds.getHeight() * 0.022f)
@@ -1815,6 +1970,7 @@ bool MainComponent::keyPressed (const juce::KeyPress& key)
                                  static_cast<juce::Component*> (&layerUpButton),
                                  static_cast<juce::Component*> (&saveButton),
                                  static_cast<juce::Component*> (&loadButton),
+                                 static_cast<juce::Component*> (&parameterPickerButton),
                                  static_cast<juce::Component*> (&labelEditor),
                                  static_cast<juce::Component*> (&codeEditor),
                                  static_cast<juce::Component*> (&eraseButton) })
@@ -1834,7 +1990,7 @@ bool MainComponent::keyPressed (const juce::KeyPress& key)
         return true;
     }
 
-    if (std::tolower ((unsigned char) key.getTextCharacter()) == 'm' && isPluginMode() && ! showingTitleScreen)
+    if (std::tolower ((unsigned char) key.getTextCharacter()) == 'm' && ! showingTitleScreen)
     {
         mixerVisible = ! mixerVisible;
         resized();
@@ -1909,7 +2065,26 @@ void MainComponent::initialiseGrid (AppMode mode)
 {
     grid.clear();
     currentMode = mode;
-    bpm = mode == AppMode::harmonicGeometry ? 112.0 : (mode == AppMode::harmonySpace ? 104.0 : (mode == AppMode::cellularGrid ? 132.0 : 148.0));
+    const auto presetIndex = modePresetIndices[(size_t) modeIndex (mode)] % 3;
+    bpm = mode == AppMode::harmonicGeometry ? 112.0 : (mode == AppMode::harmonySpace ? 104.0 : (mode == AppMode::cellularGrid ? 132.0 : 136.0));
+    if (mode == AppMode::cellularGrid)
+    {
+        currentCellularRule = CellularRule::bloom;
+        currentCellularBirthRange = { 5, 5 };
+        currentCellularSurviveRange = { 4, 5 };
+        if (presetIndex == 1)
+        {
+            currentCellularRule = CellularRule::maze;
+            currentCellularBirthRange = { 5, 6 };
+            currentCellularSurviveRange = { 5, 7 };
+        }
+        else if (presetIndex == 2)
+        {
+            currentCellularRule = CellularRule::coral;
+            currentCellularBirthRange = { 6, 7 };
+            currentCellularSurviveRange = { 4, 6 };
+        }
+    }
 
     for (int layer = 0; layer < layers; ++layer)
         for (int row = 0; row < rows; ++row)
@@ -1940,7 +2115,7 @@ void MainComponent::initialiseGrid (AppMode mode)
 
     if (mode == AppMode::harmonicGeometry)
     {
-        bpm = 92.0;
+        bpm = presetIndex == 0 ? 92.0 : (presetIndex == 1 ? 84.0 : 104.0);
 
         // Layer 1: soft lounge comping with smooth ii-V-I motion
         stamp (0, 0, 0, GlyphType::pulse, "1");
@@ -2044,15 +2219,30 @@ void MainComponent::initialiseGrid (AppMode mode)
         stamp (7, 2, 12, GlyphType::wormhole, "3");
         stamp (2, 6, 2, GlyphType::wormhole, "3");
 
+        if (presetIndex == 1)
+        {
+            stamp (0, 0, 9, GlyphType::voice, "52");
+            stamp (0, 0, 10, GlyphType::chord, "1");
+            stamp (4, 4, 13, GlyphType::clap, "0.12");
+            stamp (5, 2, 10, GlyphType::voice, "74");
+        }
+        else if (presetIndex == 2)
+        {
+            stamp (1, 0, 13, GlyphType::key, "10");
+            stamp (2, 0, 10, GlyphType::repeat, "2");
+            stamp (6, 4, 7, GlyphType::decay, "1.75");
+            stamp (7, 1, 10, GlyphType::voice, "82");
+        }
+
         selectedCell = getCell (0, 0, 1);
         return;
     }
 
     if (mode == AppMode::harmonySpace)
     {
-        bpm = 76.0;
-        harmonySpaceKeyCenter = 7;
-        harmonySpaceConstraintMode = 1;
+        bpm = presetIndex == 0 ? 76.0 : (presetIndex == 1 ? 68.0 : 88.0);
+        harmonySpaceKeyCenter = presetIndex == 2 ? 0 : 7;
+        harmonySpaceConstraintMode = presetIndex == 1 ? 2 : 1;
         harmonySpaceGestureRecordEnabled = false;
         harmonySpaceGesturePoints.clear();
 
@@ -2204,13 +2394,26 @@ void MainComponent::initialiseGrid (AppMode mode)
         stamp (7, 1, 14, GlyphType::wormhole, "2");
         stamp (7, 3, 2, GlyphType::wormhole, "2");
 
+        if (presetIndex == 1)
+        {
+            stamp (1, 1, 10, GlyphType::chord, "4");
+            stamp (2, 5, 9, GlyphType::voice, "47");
+            stamp (5, 6, 11, GlyphType::voice, "79");
+        }
+        else if (presetIndex == 2)
+        {
+            stamp (1, 0, 0, GlyphType::key, "0");
+            stamp (3, 4, 9, GlyphType::voice, "67");
+            stamp (4, 0, 7, GlyphType::decay, "1.9");
+        }
+
         selectedCell = getCell (0, 0, 1);
         return;
     }
 
     if (mode == AppMode::cellularGrid)
     {
-        bpm = 108.0;
+        bpm = presetIndex == 0 ? 108.0 : (presetIndex == 1 ? 92.0 : 124.0);
 
         // Layer 1: sparse low pulse islands for the automaton to grow across.
         stamp (0, 0, 0, GlyphType::pulse, "1");
@@ -2279,6 +2482,19 @@ void MainComponent::initialiseGrid (AppMode mode)
         stamp (7, 2, 3, GlyphType::wormhole, "2");
         stamp (7, 6, 12, GlyphType::wormhole, "2");
 
+        if (presetIndex == 1)
+        {
+            stamp (1, 5, 1, GlyphType::voice, "52");
+            stamp (3, 3, 9, GlyphType::repeat, "2");
+            stamp (6, 1, 8, GlyphType::tempo, "0.85");
+        }
+        else if (presetIndex == 2)
+        {
+            stamp (0, 2, 5, GlyphType::tone, "45");
+            stamp (1, 3, 11, GlyphType::voice, "67");
+            stamp (6, 3, 4, GlyphType::tempo, "1.35");
+        }
+
         selectedCell = getCell (0, 0, 1);
         return;
     }
@@ -2288,14 +2504,14 @@ void MainComponent::initialiseGrid (AppMode mode)
     stamp (0, 0, 1, GlyphType::tone, "33");
     stamp (0, 0, 2, GlyphType::audio, "1");
     stamp (0, 0, 4, GlyphType::pulse, "1");
-    stamp (0, 0, 5, GlyphType::tone, "36");
+    stamp (0, 0, 5, GlyphType::tone, "38");
     stamp (0, 0, 6, GlyphType::audio, "0.95");
     stamp (0, 0, 8, GlyphType::pulse, "1");
     stamp (0, 0, 9, GlyphType::tone, "38");
     stamp (0, 0, 10, GlyphType::audio, "1");
     stamp (0, 0, 11, GlyphType::repeat, "1");
     stamp (0, 0, 12, GlyphType::pulse, "1");
-    stamp (0, 0, 13, GlyphType::tone, "41");
+    stamp (0, 0, 13, GlyphType::tone, "36");
     stamp (0, 0, 14, GlyphType::audio, "1");
 
     stamp (0, 1, 1, GlyphType::pulse, "1");
@@ -2305,21 +2521,21 @@ void MainComponent::initialiseGrid (AppMode mode)
     stamp (0, 1, 6, GlyphType::voice, "60");
     stamp (0, 1, 7, GlyphType::audio, "0.86");
     stamp (0, 1, 9, GlyphType::pulse, "1");
-    stamp (0, 1, 10, GlyphType::voice, "64");
+    stamp (0, 1, 10, GlyphType::voice, "62");
     stamp (0, 1, 11, GlyphType::audio, "0.88");
     stamp (0, 1, 12, GlyphType::ratchet, "2");
     stamp (0, 1, 13, GlyphType::pulse, "1");
-    stamp (0, 1, 14, GlyphType::voice, "67");
+    stamp (0, 1, 14, GlyphType::voice, "69");
     stamp (0, 1, 15, GlyphType::audio, "0.9");
 
     stamp (0, 2, 2, GlyphType::pulse, "1");
     stamp (0, 2, 3, GlyphType::voice, "69");
     stamp (0, 2, 4, GlyphType::audio, "0.68");
     stamp (0, 2, 6, GlyphType::pulse, "1");
-    stamp (0, 2, 7, GlyphType::voice, "72");
+    stamp (0, 2, 7, GlyphType::voice, "71");
     stamp (0, 2, 8, GlyphType::audio, "0.72");
     stamp (0, 2, 10, GlyphType::pulse, "1");
-    stamp (0, 2, 11, GlyphType::voice, "74");
+    stamp (0, 2, 11, GlyphType::voice, "76");
     stamp (0, 2, 12, GlyphType::audio, "0.7");
     stamp (0, 2, 13, GlyphType::wormhole, "10");
     stamp (0, 2, 14, GlyphType::pulse, "1");
@@ -2332,7 +2548,7 @@ void MainComponent::initialiseGrid (AppMode mode)
     stamp (0, 3, 8, GlyphType::pulse, "1");
     stamp (0, 3, 9, GlyphType::voice, "79");
     stamp (0, 3, 10, GlyphType::audio, "0.52");
-    stamp (0, 3, 11, GlyphType::voice, "91");
+    stamp (0, 3, 11, GlyphType::voice, "88");
     stamp (0, 3, 12, GlyphType::repeat, "1");
     stamp (0, 3, 13, GlyphType::audio, "0.46");
 
@@ -2692,6 +2908,24 @@ void MainComponent::initialiseGrid (AppMode mode)
     stamp (7, 6, 11, GlyphType::repeat, "3");
     stamp (7, 6, 15, GlyphType::length, "3");
 
+    if (presetIndex == 1)
+    {
+        bpm = 122.0;
+        stamp (0, 0, 9, GlyphType::tone, "41");
+        stamp (0, 1, 6, GlyphType::voice, "64");
+        stamp (0, 4, 13, GlyphType::hat, "0.72");
+        stamp (4, 2, 9, GlyphType::repeat, "2");
+    }
+    else if (presetIndex == 2)
+    {
+        bpm = 148.0;
+        stamp (0, 2, 11, GlyphType::voice, "79");
+        stamp (0, 5, 5, GlyphType::ratchet, "5");
+        stamp (3, 1, 6, GlyphType::accent, "1.24");
+        stamp (7, 0, 6, GlyphType::wormhole, "4");
+        stamp (7, 5, 13, GlyphType::wormhole, "4");
+    }
+
     selectedCell = getCell (0, 0, 1);
 }
 
@@ -2780,6 +3014,10 @@ void MainComponent::applyMode (AppMode mode, ModeVariant variant, bool showTitle
     inspectorSizeMode = PanelSizeMode::defaultSize;
     visibleLayer = 0;
     initialiseGrid (mode);
+    caRuleButton.setButtonText ("Rule: " + cellularRuleName (currentCellularRule));
+    presetButton.setButtonText ("Preset " + juce::String (modePresetIndices[(size_t) modeIndex (mode)] + 1));
+    caBirthButton.setButtonText (cellularRangeLabel ("Birth", currentCellularBirthRange));
+    caSurviveButton.setButtonText (cellularRangeLabel ("Stay", currentCellularSurviveRange));
     updateTempoControl();
     initialiseSnakes();
     resetSynthVoices();
@@ -2826,7 +3064,7 @@ void MainComponent::createUi()
     mainArea.addAndMakeVisible (tempoControlLabel);
     tempoSlider.setSliderStyle (juce::Slider::LinearHorizontal);
     tempoSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 64, 24);
-    tempoSlider.setRange (40.0, 220.0, 1.0);
+    tempoSlider.setRange (5.0, 220.0, 1.0);
     tempoSlider.onValueChange = [this]
     {
         bpm = tempoSlider.getValue();
@@ -2838,6 +3076,10 @@ void MainComponent::createUi()
     playButton.addListener (this);
     clearButton.addListener (this);
     spawnSnakeButton.addListener (this);
+    presetButton.addListener (this);
+    caRuleButton.addListener (this);
+    caBirthButton.addListener (this);
+    caSurviveButton.addListener (this);
     mixerToggleButton.addListener (this);
     saveButton.addListener (this);
     loadButton.addListener (this);
@@ -2859,6 +3101,10 @@ void MainComponent::createUi()
     addAndMakeVisible (playButton);
     addAndMakeVisible (clearButton);
     addAndMakeVisible (spawnSnakeButton);
+    addAndMakeVisible (presetButton);
+    addAndMakeVisible (caRuleButton);
+    addAndMakeVisible (caBirthButton);
+    addAndMakeVisible (caSurviveButton);
     addAndMakeVisible (mixerToggleButton);
     addAndMakeVisible (saveButton);
     addAndMakeVisible (loadButton);
@@ -2898,6 +3144,26 @@ void MainComponent::createUi()
         auto& effectCGuiButton = mixerEffectCGuiButtons[(size_t) strip];
         auto& effectDButton = mixerEffectDButtons[(size_t) strip];
         auto& effectDGuiButton = mixerEffectDGuiButtons[(size_t) strip];
+        auto& midiFxBypassButton = mixerMidiFxBypassButtons[(size_t) strip];
+        auto& instrumentBypassButton = mixerInstrumentBypassButtons[(size_t) strip];
+        auto& effectABypassButton = mixerEffectABypassButtons[(size_t) strip];
+        auto& effectBBypassButton = mixerEffectBBypassButtons[(size_t) strip];
+        auto& effectCBypassButton = mixerEffectCBypassButtons[(size_t) strip];
+        auto& effectDBypassButton = mixerEffectDBypassButtons[(size_t) strip];
+        auto& midiFxRemoveButton = mixerMidiFxRemoveButtons[(size_t) strip];
+        auto& instrumentRemoveButton = mixerInstrumentRemoveButtons[(size_t) strip];
+        auto& effectARemoveButton = mixerEffectARemoveButtons[(size_t) strip];
+        auto& effectBRemoveButton = mixerEffectBRemoveButtons[(size_t) strip];
+        auto& effectCRemoveButton = mixerEffectCRemoveButtons[(size_t) strip];
+        auto& effectDRemoveButton = mixerEffectDRemoveButtons[(size_t) strip];
+        auto& effectAUpButton = mixerEffectAUpButtons[(size_t) strip];
+        auto& effectBUpButton = mixerEffectBUpButtons[(size_t) strip];
+        auto& effectCUpButton = mixerEffectCUpButtons[(size_t) strip];
+        auto& effectDUpButton = mixerEffectDUpButtons[(size_t) strip];
+        auto& effectADownButton = mixerEffectADownButtons[(size_t) strip];
+        auto& effectBDownButton = mixerEffectBDownButtons[(size_t) strip];
+        auto& effectCDownButton = mixerEffectCDownButtons[(size_t) strip];
+        auto& effectDDownButton = mixerEffectDDownButtons[(size_t) strip];
         midiFxButton.setButtonText ("Load MIDI FX");
         midiFxGuiButton.setButtonText ("UI");
         instrumentButton.setButtonText ("Load Instrument");
@@ -2910,6 +3176,14 @@ void MainComponent::createUi()
         effectCGuiButton.setButtonText ("UI");
         effectDButton.setButtonText ("Load FX D");
         effectDGuiButton.setButtonText ("UI");
+        for (auto* bypassButton : { &midiFxBypassButton, &instrumentBypassButton, &effectABypassButton, &effectBBypassButton, &effectCBypassButton, &effectDBypassButton })
+            bypassButton->setButtonText ("B");
+        for (auto* removeButton : { &midiFxRemoveButton, &instrumentRemoveButton, &effectARemoveButton, &effectBRemoveButton, &effectCRemoveButton, &effectDRemoveButton })
+            removeButton->setButtonText ("X");
+        for (auto* upButton : { &effectAUpButton, &effectBUpButton, &effectCUpButton, &effectDUpButton })
+            upButton->setButtonText ("^");
+        for (auto* downButton : { &effectADownButton, &effectBDownButton, &effectCDownButton, &effectDDownButton })
+            downButton->setButtonText ("v");
         midiFxButton.setComponentID ("strip" + juce::String (strip) + "_midiFx");
         midiFxGuiButton.setComponentID ("strip" + juce::String (strip) + "_midiFxGui");
         instrumentButton.setComponentID ("strip" + juce::String (strip) + "_instrument");
@@ -2934,6 +3208,11 @@ void MainComponent::createUi()
         effectCGuiButton.addListener (this);
         effectDButton.addListener (this);
         effectDGuiButton.addListener (this);
+        for (auto* extraButton : { &midiFxBypassButton, &instrumentBypassButton, &effectABypassButton, &effectBBypassButton, &effectCBypassButton, &effectDBypassButton,
+                                   &midiFxRemoveButton, &instrumentRemoveButton, &effectARemoveButton, &effectBRemoveButton, &effectCRemoveButton, &effectDRemoveButton,
+                                   &effectAUpButton, &effectBUpButton, &effectCUpButton, &effectDUpButton,
+                                   &effectADownButton, &effectBDownButton, &effectCDownButton, &effectDDownButton })
+            extraButton->addListener (this);
 
         for (auto pair : { std::pair<juce::TextButton*, PluginSlotKind> { &midiFxButton, PluginSlotKind::midiFx },
                            { &instrumentButton, PluginSlotKind::instrument },
@@ -2958,6 +3237,16 @@ void MainComponent::createUi()
             guiButton->setColour (juce::TextButton::textColourOffId, juce::Colours::white.withAlpha (0.96f));
             guiButton->setColour (juce::TextButton::textColourOnId, juce::Colours::white);
         }
+        for (auto* utilityButton : { &midiFxBypassButton, &instrumentBypassButton, &effectABypassButton, &effectBBypassButton, &effectCBypassButton, &effectDBypassButton,
+                                     &midiFxRemoveButton, &instrumentRemoveButton, &effectARemoveButton, &effectBRemoveButton, &effectCRemoveButton, &effectDRemoveButton,
+                                     &effectAUpButton, &effectBUpButton, &effectCUpButton, &effectDUpButton,
+                                     &effectADownButton, &effectBDownButton, &effectCDownButton, &effectDDownButton })
+        {
+            utilityButton->setColour (juce::TextButton::buttonColourId, juce::Colour::fromFloatRGBA (0.08f, 0.10f, 0.11f, 0.92f));
+            utilityButton->setColour (juce::TextButton::buttonOnColourId, juce::Colour::fromFloatRGBA (0.95f, 0.95f, 0.95f, 0.22f));
+            utilityButton->setColour (juce::TextButton::textColourOffId, juce::Colours::white.withAlpha (0.92f));
+            utilityButton->setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+        }
 
         mixerArea.addAndMakeVisible (midiFxButton);
         mixerArea.addAndMakeVisible (midiFxGuiButton);
@@ -2971,6 +3260,11 @@ void MainComponent::createUi()
         mixerArea.addAndMakeVisible (effectCGuiButton);
         mixerArea.addAndMakeVisible (effectDButton);
         mixerArea.addAndMakeVisible (effectDGuiButton);
+        for (auto* extraButton : { &midiFxBypassButton, &instrumentBypassButton, &effectABypassButton, &effectBBypassButton, &effectCBypassButton, &effectDBypassButton,
+                                   &midiFxRemoveButton, &instrumentRemoveButton, &effectARemoveButton, &effectBRemoveButton, &effectCRemoveButton, &effectDRemoveButton,
+                                   &effectAUpButton, &effectBUpButton, &effectCUpButton, &effectDUpButton,
+                                   &effectADownButton, &effectBDownButton, &effectCDownButton, &effectDDownButton })
+            mixerArea.addAndMakeVisible (extraButton);
 
         auto& volumeSlider = mixerVolumeSliders[(size_t) strip];
         auto& panSlider = mixerPanSliders[(size_t) strip];
@@ -2979,7 +3273,7 @@ void MainComponent::createUi()
                                                           : juce::Colour::fromFloatRGBA (1.0f, 0.34f, 0.84f, 1.0f));
         volumeSlider.setSliderStyle (juce::Slider::LinearVertical);
         volumeSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 52, 18);
-        volumeSlider.setRange (0.0, 1.2, 0.01);
+        volumeSlider.setRange (0.0, 10.0, 0.01);
         volumeSlider.setValue (mixerStrips[(size_t) strip].volume);
         volumeSlider.setAccentColour (stripAccent);
         volumeSlider.setColour (juce::Slider::textBoxTextColourId, juce::Colours::white.withAlpha (0.92f));
@@ -3176,8 +3470,10 @@ void MainComponent::createUi()
     codeEditor.addListener (this);
     codeEditor.setMultiLine (true);
     codeEditor.setReturnKeyStartsNewLine (true);
+    parameterPickerButton.addListener (this);
     addAndMakeVisible (labelEditor);
     addAndMakeVisible (codeEditor);
+    addAndMakeVisible (parameterPickerButton);
 
     const auto addTool = [this] (GlyphType type)
     {
@@ -3230,6 +3526,7 @@ void MainComponent::paint (juce::Graphics& g)
     const auto isHarmonicMode = currentMode == AppMode::harmonicGeometry;
     const auto isCellularMode = currentMode == AppMode::cellularGrid;
     const auto isHarmonySpaceMode = currentMode == AppMode::harmonySpace;
+    const auto showingMixer = mixerVisible && ! showingTitleScreen;
 
     if (showingTitleScreen)
     {
@@ -3306,8 +3603,13 @@ void MainComponent::paint (juce::Graphics& g)
                                 : (isHarmonySpaceMode ? juce::Colour::fromFloatRGBA (0.09f, 0.08f, 0.03f, 0.94f)
                                                       : makePanelColour())));
     g.fillRoundedRectangle (mainArea.getBounds().toFloat(), 18.0f);
-    g.fillRoundedRectangle (previewArea.getBounds().toFloat(), 18.0f);
-    g.fillRoundedRectangle (inspector.getBounds().toFloat(), 18.0f);
+    if (showingMixer)
+        g.fillRoundedRectangle (mixerArea.getBounds().toFloat(), 18.0f);
+    else
+    {
+        g.fillRoundedRectangle (previewArea.getBounds().toFloat(), 18.0f);
+        g.fillRoundedRectangle (inspector.getBounds().toFloat(), 18.0f);
+    }
 
     auto footerBounds = getLocalBounds().removeFromBottom (56).toFloat().reduced (12.0f, 4.0f);
     juce::ColourGradient footerGlow (isHarmonicMode ? juce::Colour::fromFloatRGBA (0.42f, 0.62f, 1.0f, 0.18f)
@@ -3395,6 +3697,10 @@ void MainComponent::resized()
         for (auto* component : { static_cast<juce::Component*> (&playButton),
                                  static_cast<juce::Component*> (&clearButton),
                                  static_cast<juce::Component*> (&spawnSnakeButton),
+                                 static_cast<juce::Component*> (&presetButton),
+                                 static_cast<juce::Component*> (&caRuleButton),
+                                 static_cast<juce::Component*> (&caBirthButton),
+                                 static_cast<juce::Component*> (&caSurviveButton),
                                  static_cast<juce::Component*> (&mixerToggleButton),
                                  static_cast<juce::Component*> (&layerDownButton),
                                  static_cast<juce::Component*> (&layerUpButton),
@@ -3452,6 +3758,10 @@ void MainComponent::resized()
     for (auto* component : { static_cast<juce::Component*> (&playButton),
                              static_cast<juce::Component*> (&clearButton),
                              static_cast<juce::Component*> (&spawnSnakeButton),
+                             static_cast<juce::Component*> (&presetButton),
+                             static_cast<juce::Component*> (&caRuleButton),
+                             static_cast<juce::Component*> (&caBirthButton),
+                             static_cast<juce::Component*> (&caSurviveButton),
                              static_cast<juce::Component*> (&mixerToggleButton),
                              static_cast<juce::Component*> (&layerDownButton),
                              static_cast<juce::Component*> (&layerUpButton),
@@ -3474,11 +3784,17 @@ void MainComponent::resized()
     playButton.setBounds (footerButtonBounds (footer.removeFromLeft (120), 16));
     clearButton.setBounds (footerButtonBounds (footer.removeFromLeft (140), 6));
     spawnSnakeButton.setBounds (footerButtonBounds (footer.removeFromLeft (150), 6));
-    mixerToggleButton.setVisible (isPluginMode());
-    if (isPluginMode())
+    presetButton.setVisible (true);
+    presetButton.setBounds (footerButtonBounds (footer.removeFromLeft (98), 6));
+    caRuleButton.setVisible (currentMode == AppMode::cellularGrid);
+    caBirthButton.setVisible (currentMode == AppMode::cellularGrid);
+    caSurviveButton.setVisible (currentMode == AppMode::cellularGrid);
+    caRuleButton.setBounds ({});
+    caBirthButton.setBounds ({});
+    caSurviveButton.setBounds ({});
+    mixerToggleButton.setVisible (true);
+    if (true)
         mixerToggleButton.setBounds (footerButtonBounds (footer.removeFromLeft (98), 6));
-    else
-        mixerToggleButton.setBounds ({});
     auto layerControls = footer.removeFromLeft (470);
     layerDownButton.setBounds (footerButtonBounds (layerControls.removeFromLeft (96), 6));
     layerUpButton.setBounds (footerButtonBounds (layerControls.removeFromLeft (96), 6));
@@ -3502,7 +3818,7 @@ void MainComponent::resized()
         ? (previewOnlyFocus ? rightArea.reduced (16) : rightArea.removeFromTop (406).reduced (16))
         : juce::Rectangle<int>();
     auto inspectorBounds = inspectorWidth > 0 ? rightArea.reduced (16) : juce::Rectangle<int>();
-    const auto showingMixer = isPluginMode() && mixerVisible;
+    const auto showingMixer = mixerVisible;
     previewArea.setVisible (! showingMixer && previewWidth > 0);
     inspector.setVisible (! showingMixer && inspectorWidth > 0);
     mixerArea.setVisible (showingMixer);
@@ -3510,6 +3826,7 @@ void MainComponent::resized()
     inspector.setBounds (inspectorBounds);
     mixerArea.setBounds (showingMixer ? fullRightArea.reduced (16) : juce::Rectangle<int>());
     for (auto* component : { static_cast<juce::Component*> (&labelEditor),
+                             static_cast<juce::Component*> (&parameterPickerButton),
                              static_cast<juce::Component*> (&codeEditor),
                              static_cast<juce::Component*> (&eraseButton) })
         component->setVisible (! showingMixer && inspectorWidth > 0);
@@ -3520,6 +3837,15 @@ void MainComponent::resized()
     auto tempoRow = mainAreaLocal.removeFromTop (34);
     tempoControlLabel.setBounds (tempoRow.removeFromLeft (72));
     tempoSlider.setBounds (tempoRow.reduced (4, 2));
+    if (currentMode == AppMode::cellularGrid)
+    {
+        mainAreaLocal.removeFromTop (6);
+        auto caRow = mainAreaLocal.removeFromTop (36);
+        auto caRowAbs = caRow.translated (mainArea.getX(), mainArea.getY());
+        caRuleButton.setBounds (caRowAbs.removeFromLeft (180).reduced (4, 2));
+        caBirthButton.setBounds (caRowAbs.removeFromLeft (150).reduced (4, 2));
+        caSurviveButton.setBounds (caRowAbs.removeFromLeft (150).reduced (4, 2));
+    }
     mainAreaLocal.removeFromTop (10);
     auto gridArea = mainAreaLocal.translated (mainArea.getX(), mainArea.getY());
     const auto gap = 8;
@@ -3539,13 +3865,13 @@ void MainComponent::resized()
         cellButtons[i]->setVisible (! isHarmonySpaceMode);
     }
 
-    stage.setVisible (isHarmonySpaceMode || previewWidth > 0);
-    if (isHarmonySpaceMode)
+    stage.setVisible (! showingMixer && (isHarmonySpaceMode || previewWidth > 0));
+    if (! showingMixer && isHarmonySpaceMode)
     {
         auto stageBounds = mainAreaLocal.translated (mainArea.getX(), mainArea.getY()).reduced (4);
         stage.setBounds (stageBounds);
     }
-    else if (previewWidth > 0)
+    else if (! showingMixer && previewWidth > 0)
     {
         auto stageBounds = previewArea.getLocalBounds().reduced (currentMode == AppMode::harmonicGeometry ? 6 : (currentMode == AppMode::harmonySpace ? 8 : 14));
 
@@ -3553,6 +3879,10 @@ void MainComponent::resized()
         stageBounds = juce::Rectangle<int> (squareSize, squareSize).withCentre (previewArea.getBounds().getCentre());
 
         stage.setBounds (stageBounds);
+    }
+    else
+    {
+        stage.setBounds ({});
     }
 
     if (inspectorWidth > 0)
@@ -3584,8 +3914,25 @@ void MainComponent::resized()
 
 void MainComponent::layoutInspector (juce::Rectangle<int> area)
 {
+    const auto showCaInspectorControls = currentMode == AppMode::cellularGrid && inspector.isVisible();
+
+    if (showCaInspectorControls)
+    {
+        caRuleButton.setVisible (true);
+        caBirthButton.setVisible (true);
+        caSurviveButton.setVisible (true);
+        caRuleButton.setBounds (area.removeFromTop (34));
+        area.removeFromTop (6);
+        caBirthButton.setBounds (area.removeFromTop (34));
+        area.removeFromTop (6);
+        caSurviveButton.setBounds (area.removeFromTop (34));
+        area.removeFromTop (12);
+    }
+
     glyphValueLabel.setBounds (area.removeFromTop (28));
     labelEditor.setBounds (area.removeFromTop (40));
+    area.removeFromTop (8);
+    parameterPickerButton.setBounds (area.removeFromTop (32));
     area.removeFromTop (8);
     codeEditor.setBounds (area.removeFromTop (260));
     area.removeFromTop (8);
@@ -3594,23 +3941,45 @@ void MainComponent::layoutInspector (juce::Rectangle<int> area)
 
 void MainComponent::layoutMixer (juce::Rectangle<int> area)
 {
-    const auto showMixerControls = mixerArea.isVisible() && isPluginMode() && mixerVisible && ! showingTitleScreen;
+    const auto showMixerControls = mixerArea.isVisible() && mixerVisible && ! showingTitleScreen;
+    const auto showPluginSlots = showMixerControls && isPluginMode();
+    const auto compactLayout = area.getWidth() < 520;
     auto stripWidth = area.getWidth() / (int) mixerStrips.size();
     for (int strip = 0; strip < (int) mixerStrips.size(); ++strip)
     {
         mixerStripLabels[(size_t) strip].setVisible (showMixerControls);
-        mixerMidiFxButtons[(size_t) strip].setVisible (showMixerControls);
-        mixerMidiFxGuiButtons[(size_t) strip].setVisible (showMixerControls);
-        mixerInstrumentButtons[(size_t) strip].setVisible (showMixerControls);
-        mixerInstrumentGuiButtons[(size_t) strip].setVisible (showMixerControls);
-        mixerEffectAButtons[(size_t) strip].setVisible (showMixerControls);
-        mixerEffectAGuiButtons[(size_t) strip].setVisible (showMixerControls);
-        mixerEffectBButtons[(size_t) strip].setVisible (showMixerControls);
-        mixerEffectBGuiButtons[(size_t) strip].setVisible (showMixerControls);
-        mixerEffectCButtons[(size_t) strip].setVisible (showMixerControls);
-        mixerEffectCGuiButtons[(size_t) strip].setVisible (showMixerControls);
-        mixerEffectDButtons[(size_t) strip].setVisible (showMixerControls);
-        mixerEffectDGuiButtons[(size_t) strip].setVisible (showMixerControls);
+        mixerMidiFxButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerMidiFxGuiButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerInstrumentButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerInstrumentGuiButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectAButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectAGuiButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectBButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectBGuiButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectCButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectCGuiButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectDButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectDGuiButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerMidiFxBypassButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerInstrumentBypassButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectABypassButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectBBypassButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectCBypassButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectDBypassButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerMidiFxRemoveButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerInstrumentRemoveButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectARemoveButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectBRemoveButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectCRemoveButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectDRemoveButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectAUpButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectBUpButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectCUpButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectDUpButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectADownButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectBDownButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectCDownButtons[(size_t) strip].setVisible (showPluginSlots);
+        mixerEffectDDownButtons[(size_t) strip].setVisible (showPluginSlots);
         mixerVolumeLabels[(size_t) strip].setVisible (showMixerControls);
         mixerPanLabels[(size_t) strip].setVisible (showMixerControls);
         mixerVolumeSliders[(size_t) strip].setVisible (showMixerControls);
@@ -3631,6 +4000,26 @@ void MainComponent::layoutMixer (juce::Rectangle<int> area)
             mixerEffectCGuiButtons[(size_t) strip].setBounds ({});
             mixerEffectDButtons[(size_t) strip].setBounds ({});
             mixerEffectDGuiButtons[(size_t) strip].setBounds ({});
+            mixerMidiFxBypassButtons[(size_t) strip].setBounds ({});
+            mixerInstrumentBypassButtons[(size_t) strip].setBounds ({});
+            mixerEffectABypassButtons[(size_t) strip].setBounds ({});
+            mixerEffectBBypassButtons[(size_t) strip].setBounds ({});
+            mixerEffectCBypassButtons[(size_t) strip].setBounds ({});
+            mixerEffectDBypassButtons[(size_t) strip].setBounds ({});
+            mixerMidiFxRemoveButtons[(size_t) strip].setBounds ({});
+            mixerInstrumentRemoveButtons[(size_t) strip].setBounds ({});
+            mixerEffectARemoveButtons[(size_t) strip].setBounds ({});
+            mixerEffectBRemoveButtons[(size_t) strip].setBounds ({});
+            mixerEffectCRemoveButtons[(size_t) strip].setBounds ({});
+            mixerEffectDRemoveButtons[(size_t) strip].setBounds ({});
+            mixerEffectAUpButtons[(size_t) strip].setBounds ({});
+            mixerEffectBUpButtons[(size_t) strip].setBounds ({});
+            mixerEffectCUpButtons[(size_t) strip].setBounds ({});
+            mixerEffectDUpButtons[(size_t) strip].setBounds ({});
+            mixerEffectADownButtons[(size_t) strip].setBounds ({});
+            mixerEffectBDownButtons[(size_t) strip].setBounds ({});
+            mixerEffectCDownButtons[(size_t) strip].setBounds ({});
+            mixerEffectDDownButtons[(size_t) strip].setBounds ({});
             mixerVolumeLabels[(size_t) strip].setBounds ({});
             mixerPanLabels[(size_t) strip].setBounds ({});
             mixerVolumeSliders[(size_t) strip].setBounds ({});
@@ -3638,44 +4027,75 @@ void MainComponent::layoutMixer (juce::Rectangle<int> area)
             continue;
         }
 
-        auto stripArea = area.removeFromLeft (strip == (int) mixerStrips.size() - 1 ? area.getWidth() : stripWidth).reduced (8);
-        mixerStripLabels[(size_t) strip].setBounds (stripArea.removeFromTop (28));
-        stripArea.removeFromTop (8);
-        auto midiFxRow = stripArea.removeFromTop (30);
-        mixerMidiFxGuiButtons[(size_t) strip].setBounds (midiFxRow.removeFromRight (38));
-        midiFxRow.removeFromRight (4);
-        mixerMidiFxButtons[(size_t) strip].setBounds (midiFxRow);
-        stripArea.removeFromTop (5);
-        auto instrumentRow = stripArea.removeFromTop (34);
-        mixerInstrumentGuiButtons[(size_t) strip].setBounds (instrumentRow.removeFromRight (38));
-        instrumentRow.removeFromRight (4);
-        mixerInstrumentButtons[(size_t) strip].setBounds (instrumentRow);
-        stripArea.removeFromTop (5);
-        auto effectARow = stripArea.removeFromTop (28);
-        mixerEffectAGuiButtons[(size_t) strip].setBounds (effectARow.removeFromRight (38));
-        effectARow.removeFromRight (4);
-        mixerEffectAButtons[(size_t) strip].setBounds (effectARow);
-        stripArea.removeFromTop (4);
-        auto effectBRow = stripArea.removeFromTop (28);
-        mixerEffectBGuiButtons[(size_t) strip].setBounds (effectBRow.removeFromRight (38));
-        effectBRow.removeFromRight (4);
-        mixerEffectBButtons[(size_t) strip].setBounds (effectBRow);
-        stripArea.removeFromTop (4);
-        auto effectCRow = stripArea.removeFromTop (28);
-        mixerEffectCGuiButtons[(size_t) strip].setBounds (effectCRow.removeFromRight (38));
-        effectCRow.removeFromRight (4);
-        mixerEffectCButtons[(size_t) strip].setBounds (effectCRow);
-        stripArea.removeFromTop (4);
-        auto effectDRow = stripArea.removeFromTop (28);
-        mixerEffectDGuiButtons[(size_t) strip].setBounds (effectDRow.removeFromRight (38));
-        effectDRow.removeFromRight (4);
-        mixerEffectDButtons[(size_t) strip].setBounds (effectDRow);
-        stripArea.removeFromTop (10);
+        auto stripArea = area.removeFromLeft (strip == (int) mixerStrips.size() - 1 ? area.getWidth() : stripWidth).reduced (compactLayout ? 4 : 8);
+        mixerStripLabels[(size_t) strip].setBounds (stripArea.removeFromTop (compactLayout ? 22 : 28));
+        stripArea.removeFromTop (compactLayout ? 4 : 8);
+        auto layoutSlotRow = [] (juce::Rectangle<int> row,
+                                 juce::TextButton& mainButton,
+                                 juce::TextButton& guiButton,
+                                 juce::TextButton& bypassButton,
+                                 juce::TextButton& removeButton,
+                                 juce::TextButton* upButton,
+                                 juce::TextButton* downButton,
+                                 bool compact)
+        {
+            const auto auxWidth = compact ? 22 : 28;
+            const auto guiWidth = compact ? 28 : 38;
+            const auto gap = compact ? 2 : 4;
+            if (downButton != nullptr)
+            {
+                downButton->setBounds (row.removeFromRight (auxWidth));
+                row.removeFromRight (gap);
+            }
+            if (upButton != nullptr)
+            {
+                upButton->setBounds (row.removeFromRight (auxWidth));
+                row.removeFromRight (gap);
+            }
+            removeButton.setBounds (row.removeFromRight (auxWidth));
+            row.removeFromRight (gap);
+            bypassButton.setBounds (row.removeFromRight (auxWidth));
+            row.removeFromRight (gap);
+            guiButton.setBounds (row.removeFromRight (guiWidth));
+            row.removeFromRight (gap);
+            mainButton.setBounds (row);
+        };
+        if (showPluginSlots)
+        {
+            const auto midiFxHeight = compactLayout ? 24 : 30;
+            const auto instrumentHeight = compactLayout ? 26 : 34;
+            const auto effectHeight = compactLayout ? 24 : 28;
+            const auto sectionGap = compactLayout ? 3 : 5;
+            auto midiFxRow = stripArea.removeFromTop (midiFxHeight);
+            layoutSlotRow (midiFxRow, mixerMidiFxButtons[(size_t) strip], mixerMidiFxGuiButtons[(size_t) strip], mixerMidiFxBypassButtons[(size_t) strip], mixerMidiFxRemoveButtons[(size_t) strip], nullptr, nullptr, compactLayout);
+            stripArea.removeFromTop (sectionGap);
+            auto instrumentRow = stripArea.removeFromTop (instrumentHeight);
+            layoutSlotRow (instrumentRow, mixerInstrumentButtons[(size_t) strip], mixerInstrumentGuiButtons[(size_t) strip], mixerInstrumentBypassButtons[(size_t) strip], mixerInstrumentRemoveButtons[(size_t) strip], nullptr, nullptr, compactLayout);
+            stripArea.removeFromTop (sectionGap);
+            auto effectARow = stripArea.removeFromTop (effectHeight);
+            layoutSlotRow (effectARow, mixerEffectAButtons[(size_t) strip], mixerEffectAGuiButtons[(size_t) strip], mixerEffectABypassButtons[(size_t) strip], mixerEffectARemoveButtons[(size_t) strip], &mixerEffectAUpButtons[(size_t) strip], &mixerEffectADownButtons[(size_t) strip], compactLayout);
+            stripArea.removeFromTop (compactLayout ? 2 : 4);
+            auto effectBRow = stripArea.removeFromTop (effectHeight);
+            layoutSlotRow (effectBRow, mixerEffectBButtons[(size_t) strip], mixerEffectBGuiButtons[(size_t) strip], mixerEffectBBypassButtons[(size_t) strip], mixerEffectBRemoveButtons[(size_t) strip], &mixerEffectBUpButtons[(size_t) strip], &mixerEffectBDownButtons[(size_t) strip], compactLayout);
+            stripArea.removeFromTop (compactLayout ? 2 : 4);
+            auto effectCRow = stripArea.removeFromTop (effectHeight);
+            layoutSlotRow (effectCRow, mixerEffectCButtons[(size_t) strip], mixerEffectCGuiButtons[(size_t) strip], mixerEffectCBypassButtons[(size_t) strip], mixerEffectCRemoveButtons[(size_t) strip], &mixerEffectCUpButtons[(size_t) strip], &mixerEffectCDownButtons[(size_t) strip], compactLayout);
+            stripArea.removeFromTop (compactLayout ? 2 : 4);
+            auto effectDRow = stripArea.removeFromTop (effectHeight);
+            layoutSlotRow (effectDRow, mixerEffectDButtons[(size_t) strip], mixerEffectDGuiButtons[(size_t) strip], mixerEffectDBypassButtons[(size_t) strip], mixerEffectDRemoveButtons[(size_t) strip], &mixerEffectDUpButtons[(size_t) strip], &mixerEffectDDownButtons[(size_t) strip], compactLayout);
+            stripArea.removeFromTop (compactLayout ? 6 : 10);
+        }
+        else
+        {
+            stripArea.removeFromTop (compactLayout ? 8 : 18);
+        }
         mixerVolumeLabels[(size_t) strip].setBounds (stripArea.removeFromTop (18));
-        mixerVolumeSliders[(size_t) strip].setBounds (stripArea.removeFromTop (juce::jmax (140, stripArea.getHeight() - 90)));
-        stripArea.removeFromTop (8);
+        const auto sliderHeight = compactLayout ? juce::jmax (96, stripArea.getHeight() - 72)
+                                                : juce::jmax (140, stripArea.getHeight() - 90);
+        mixerVolumeSliders[(size_t) strip].setBounds (stripArea.removeFromTop (sliderHeight));
+        stripArea.removeFromTop (compactLayout ? 4 : 8);
         mixerPanLabels[(size_t) strip].setBounds (stripArea.removeFromTop (18));
-        mixerPanSliders[(size_t) strip].setBounds (stripArea.removeFromTop (46));
+        mixerPanSliders[(size_t) strip].setBounds (stripArea.removeFromTop (compactLayout ? 38 : 46));
     }
 }
 
@@ -3917,6 +4337,20 @@ const MainComponent::HostedPluginSlot& MainComponent::getHostedPluginSlot (int s
 
 bool MainComponent::loadPluginIntoSlot (int stripIndex, PluginSlotKind slotKind, const juce::File& file)
 {
+    const auto slotIndex = [slotKind]
+    {
+        switch (slotKind)
+        {
+            case PluginSlotKind::midiFx: return 0;
+            case PluginSlotKind::instrument: return 1;
+            case PluginSlotKind::effectA: return 2;
+            case PluginSlotKind::effectB: return 3;
+            case PluginSlotKind::effectC: return 4;
+            case PluginSlotKind::effectD: return 5;
+        }
+        return 0;
+    }();
+
     juce::OwnedArray<juce::PluginDescription> descriptions;
     for (auto* format : pluginFormatManager.getFormats())
     {
@@ -3941,15 +4375,31 @@ bool MainComponent::loadPluginIntoSlot (int stripIndex, PluginSlotKind slotKind,
     auto& slot = getHostedPluginSlot (stripIndex, slotKind);
     if (slot.instance != nullptr)
         slot.instance->releaseResources();
+    mixerStrips[(size_t) stripIndex].pluginWindows[(size_t) slotIndex].reset();
     slot.instance = std::move (instance);
     slot.buttonText = descriptions[0]->name.isNotEmpty() ? descriptions[0]->name : file.getFileNameWithoutExtension();
     slot.pluginPath = file.getFullPathName();
+    slot.bypassed = false;
     updateMixerButtons();
     return true;
 }
 
 bool MainComponent::loadPluginIntoSlot (int stripIndex, PluginSlotKind slotKind, const juce::PluginDescription& description)
 {
+    const auto slotIndex = [slotKind]
+    {
+        switch (slotKind)
+        {
+            case PluginSlotKind::midiFx: return 0;
+            case PluginSlotKind::instrument: return 1;
+            case PluginSlotKind::effectA: return 2;
+            case PluginSlotKind::effectB: return 3;
+            case PluginSlotKind::effectC: return 4;
+            case PluginSlotKind::effectD: return 5;
+        }
+        return 0;
+    }();
+
     juce::String error;
     auto instance = std::unique_ptr<juce::AudioPluginInstance> (
         pluginFormatManager.createPluginInstance (description, currentSampleRate, currentPluginBlockSize, error));
@@ -3961,9 +4411,11 @@ bool MainComponent::loadPluginIntoSlot (int stripIndex, PluginSlotKind slotKind,
     auto& slot = getHostedPluginSlot (stripIndex, slotKind);
     if (slot.instance != nullptr)
         slot.instance->releaseResources();
+    mixerStrips[(size_t) stripIndex].pluginWindows[(size_t) slotIndex].reset();
     slot.instance = std::move (instance);
     slot.buttonText = description.name.isNotEmpty() ? description.name : description.descriptiveName;
     slot.pluginPath = description.fileOrIdentifier;
+    slot.bypassed = false;
     updateMixerButtons();
     return true;
 }
@@ -4028,7 +4480,60 @@ void MainComponent::updateMixerButtons()
                                                            && getHostedPluginSlot (strip, PluginSlotKind::effectC).instance->hasEditor());
         mixerEffectDGuiButtons[(size_t) strip].setEnabled (getHostedPluginSlot (strip, PluginSlotKind::effectD).instance != nullptr
                                                            && getHostedPluginSlot (strip, PluginSlotKind::effectD).instance->hasEditor());
+
+        const auto updateBypass = [] (juce::TextButton& button, const HostedPluginSlot& slot)
+        {
+            button.setButtonText (slot.bypassed ? "On" : "By");
+            button.setEnabled (slot.instance != nullptr);
+        };
+        const auto updateRemove = [] (juce::TextButton& button, const HostedPluginSlot& slot)
+        {
+            button.setButtonText ("X");
+            button.setEnabled (slot.instance != nullptr);
+        };
+        updateBypass (mixerMidiFxBypassButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::midiFx));
+        updateBypass (mixerInstrumentBypassButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::instrument));
+        updateBypass (mixerEffectABypassButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::effectA));
+        updateBypass (mixerEffectBBypassButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::effectB));
+        updateBypass (mixerEffectCBypassButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::effectC));
+        updateBypass (mixerEffectDBypassButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::effectD));
+        updateRemove (mixerMidiFxRemoveButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::midiFx));
+        updateRemove (mixerInstrumentRemoveButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::instrument));
+        updateRemove (mixerEffectARemoveButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::effectA));
+        updateRemove (mixerEffectBRemoveButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::effectB));
+        updateRemove (mixerEffectCRemoveButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::effectC));
+        updateRemove (mixerEffectDRemoveButtons[(size_t) strip], getHostedPluginSlot (strip, PluginSlotKind::effectD));
+        mixerEffectAUpButtons[(size_t) strip].setEnabled (false);
+        mixerEffectBUpButtons[(size_t) strip].setEnabled (getHostedPluginSlot (strip, PluginSlotKind::effectB).instance != nullptr);
+        mixerEffectCUpButtons[(size_t) strip].setEnabled (getHostedPluginSlot (strip, PluginSlotKind::effectC).instance != nullptr);
+        mixerEffectDUpButtons[(size_t) strip].setEnabled (getHostedPluginSlot (strip, PluginSlotKind::effectD).instance != nullptr);
+        mixerEffectADownButtons[(size_t) strip].setEnabled (getHostedPluginSlot (strip, PluginSlotKind::effectA).instance != nullptr);
+        mixerEffectBDownButtons[(size_t) strip].setEnabled (getHostedPluginSlot (strip, PluginSlotKind::effectB).instance != nullptr);
+        mixerEffectCDownButtons[(size_t) strip].setEnabled (getHostedPluginSlot (strip, PluginSlotKind::effectC).instance != nullptr);
+        mixerEffectDDownButtons[(size_t) strip].setEnabled (false);
     }
+}
+
+juce::StringArray MainComponent::getParameterChoicesForSlot (int stripIndex, PluginSlotKind slotKind) const
+{
+    juce::StringArray result;
+    const auto& slot = getHostedPluginSlot (stripIndex, slotKind);
+    if (slot.instance == nullptr)
+        return result;
+
+    for (int index = 0; index < slot.instance->getParameters().size(); ++index)
+    {
+        auto* parameter = slot.instance->getParameters()[index];
+        if (parameter == nullptr)
+            continue;
+
+        auto entry = "#" + juce::String (index) + " " + parameter->getName (256);
+        if (auto* withId = dynamic_cast<juce::AudioProcessorParameterWithID*> (parameter))
+            entry << " [id:" << withId->paramID << "]";
+        result.add (entry);
+    }
+
+    return result;
 }
 
 void MainComponent::showPluginEditor (int stripIndex, PluginSlotKind slotKind)
@@ -4038,9 +4543,23 @@ void MainComponent::showPluginEditor (int stripIndex, PluginSlotKind slotKind)
     if (slot.instance == nullptr || ! slot.instance->hasEditor())
         return;
 
-    if (strip.pluginWindow != nullptr)
+    const auto slotIndex = [slotKind]
     {
-        strip.pluginWindow->toFront (true);
+        switch (slotKind)
+        {
+            case PluginSlotKind::midiFx: return 0;
+            case PluginSlotKind::instrument: return 1;
+            case PluginSlotKind::effectA: return 2;
+            case PluginSlotKind::effectB: return 3;
+            case PluginSlotKind::effectC: return 4;
+            case PluginSlotKind::effectD: return 5;
+        }
+        return 0;
+    }();
+
+    if (strip.pluginWindows[(size_t) slotIndex] != nullptr)
+    {
+        strip.pluginWindows[(size_t) slotIndex]->toFront (true);
         return;
     }
 
@@ -4073,12 +4592,12 @@ void MainComponent::showPluginEditor (int stripIndex, PluginSlotKind slotKind)
     if (editor == nullptr)
         return;
 
-    strip.pluginWindow = std::make_unique<PluginEditorWindow> (
+    strip.pluginWindows[(size_t) slotIndex] = std::make_unique<PluginEditorWindow> (
         strip.name + " " + mixerSlotPrefix (slotKind),
         std::move (editor),
-        [this, stripIndex]
+        [this, stripIndex, slotIndex]
         {
-            mixerStrips[(size_t) stripIndex].pluginWindow.reset();
+            mixerStrips[(size_t) stripIndex].pluginWindows[(size_t) slotIndex].reset();
         });
 }
 
@@ -4170,16 +4689,18 @@ void MainComponent::queuePluginNote (int preferredStrip,
 
 void MainComponent::applyPluginParameterTarget (int preferredStrip, float midiNote, const juce::String& targetSpec, float fallbackNormalized) noexcept
 {
+    auto explicitStripIndex = -1;
     juce::String slotQualifier, parameterToken;
     auto normalizedValue = 0.0f;
     auto hasExplicitValue = false;
-    if (! parseParameterSpec (targetSpec, slotQualifier, parameterToken, normalizedValue, hasExplicitValue))
+    if (! parseParameterSpec (targetSpec, explicitStripIndex, slotQualifier, parameterToken, normalizedValue, hasExplicitValue))
         return;
 
     if (! hasExplicitValue)
         normalizedValue = juce::jlimit (0.0f, 1.0f, fallbackNormalized);
 
-    const auto stripIndex = resolvePreferredStrip (preferredStrip, midiNote);
+    const auto stripIndex = explicitStripIndex >= 0 ? explicitStripIndex
+                                                    : resolvePreferredStrip (preferredStrip, midiNote);
     auto tryApply = [&] (HostedPluginSlot& slot) -> bool
     {
         if (slot.instance == nullptr)
@@ -4287,18 +4808,18 @@ void MainComponent::processPluginBlock (const juce::AudioSourceChannelInfo& buff
         strip.audioBuffer.clear();
         strip.midiFxScratchBuffer.clear();
 
-        if (strip.midiFx.instance != nullptr)
+        if (strip.midiFx.instance != nullptr && ! strip.midiFx.bypassed)
             strip.midiFx.instance->processBlock (strip.midiFxScratchBuffer, strip.midiBuffer);
-        if (strip.instrument.instance != nullptr)
+        if (strip.instrument.instance != nullptr && ! strip.instrument.bypassed)
             strip.instrument.instance->processBlock (strip.audioBuffer, strip.midiBuffer);
 
-        if (strip.effectA.instance != nullptr)
+        if (strip.effectA.instance != nullptr && ! strip.effectA.bypassed)
             strip.effectA.instance->processBlock (strip.audioBuffer, emptyMidi);
-        if (strip.effectB.instance != nullptr)
+        if (strip.effectB.instance != nullptr && ! strip.effectB.bypassed)
             strip.effectB.instance->processBlock (strip.audioBuffer, emptyMidi);
-        if (strip.effectC.instance != nullptr)
+        if (strip.effectC.instance != nullptr && ! strip.effectC.bypassed)
             strip.effectC.instance->processBlock (strip.audioBuffer, emptyMidi);
-        if (strip.effectD.instance != nullptr)
+        if (strip.effectD.instance != nullptr && ! strip.effectD.bypassed)
             strip.effectD.instance->processBlock (strip.audioBuffer, emptyMidi);
 
         const auto leftGain = strip.volume * (strip.pan <= 0.0f ? 1.0f : 1.0f - strip.pan);
@@ -4320,7 +4841,7 @@ void MainComponent::processPluginBlock (const juce::AudioSourceChannelInfo& buff
     }
 
     for (int channel = 0; channel < outputBuffer->getNumChannels(); ++channel)
-        outputBuffer->applyGain (channel, bufferToFill.startSample, bufferToFill.numSamples, 0.7f);
+        outputBuffer->applyGain (channel, bufferToFill.startSample, bufferToFill.numSamples, 2.1f);
 
     currentTimeSeconds.store (running ? timeSeconds : startTimeSeconds);
     transportSequence.fetch_add (1, std::memory_order_acq_rel);
@@ -4374,7 +4895,8 @@ void MainComponent::getNextAudioBlock (const juce::AudioSourceChannelInfo& buffe
 
     for (int sample = 0; sample < bufferToFill.numSamples; ++sample)
     {
-        float value = 0.0f;
+        float leftValue = 0.0f;
+        float rightValue = 0.0f;
 
         if (running && patchSnapshot != nullptr)
         {
@@ -4392,13 +4914,24 @@ void MainComponent::getNextAudioBlock (const juce::AudioSourceChannelInfo& buffe
                 lastAdvancedTick.store (targetTick);
             }
 
-            const auto rawValue = evaluateAudioForSnapshot (*patchSnapshot, timeSeconds);
-            outputFastState += (rawValue - outputFastState) * outputFastCoeff;
+            renderInternalMix (leftValue, rightValue);
+            outputFastState += (leftValue - outputFastState) * outputFastCoeff;
             outputSlowState += (outputFastState - outputSlowState) * outputSlowCoeff;
-            const auto hp = outputHpCoeff * (outputHpState + outputSlowState - outputHpInputState);
+            const auto hpLeft = outputHpCoeff * (outputHpState + outputSlowState - outputHpInputState);
             outputHpInputState = outputSlowState;
-            outputHpState = hp;
-            value = std::tanh (hp * 1.0f) * 0.62f;
+            outputHpState = hpLeft;
+            leftValue = std::tanh (hpLeft * 1.0f) * 2.48f;
+
+            static float outputFastStateR = 0.0f;
+            static float outputSlowStateR = 0.0f;
+            static float outputHpStateR = 0.0f;
+            static float outputHpInputStateR = 0.0f;
+            outputFastStateR += (rightValue - outputFastStateR) * outputFastCoeff;
+            outputSlowStateR += (outputFastStateR - outputSlowStateR) * outputSlowCoeff;
+            const auto hpRight = outputHpCoeff * (outputHpStateR + outputSlowStateR - outputHpInputStateR);
+            outputHpInputStateR = outputSlowStateR;
+            outputHpStateR = hpRight;
+            rightValue = std::tanh (hpRight * 1.0f) * 2.48f;
             transportPhase = (float) (sequencerTime - std::floor (sequencerTime));
             timeSeconds += 1.0 / currentSampleRate;
         }
@@ -4408,12 +4941,18 @@ void MainComponent::getNextAudioBlock (const juce::AudioSourceChannelInfo& buffe
             outputSlowState *= 0.995f;
             outputHpState *= 0.995f;
             outputHpInputState *= 0.995f;
-            value = 0.0f;
+            leftValue = 0.0f;
+            rightValue = 0.0f;
+            for (int strip = 0; strip < (int) mixerStrips.size(); ++strip)
+            {
+                const auto previousLevel = publishedMixerLevels[(size_t) strip].load (std::memory_order_relaxed);
+                publishedMixerLevels[(size_t) strip].store (previousLevel * 0.90f, std::memory_order_relaxed);
+            }
         }
 
-        left[sample] = value;
+        left[sample] = leftValue;
         if (right != nullptr)
-            right[sample] = value;
+            right[sample] = rightValue;
     }
 
     if (running)
@@ -4528,6 +5067,53 @@ void MainComponent::buttonClicked (juce::Button* button)
         return;
     }
 
+    if (button == &presetButton)
+    {
+        auto& presetIndex = modePresetIndices[(size_t) modeIndex (currentMode)];
+        presetIndex = (presetIndex + 1) % 3;
+        applyMode (currentMode, currentVariant, false);
+        return;
+    }
+
+    if (button == &caRuleButton)
+    {
+        const auto nextRule = ((int) currentCellularRule + 1) % 4;
+        currentCellularRule = (CellularRule) nextRule;
+        caRuleButton.setButtonText ("Rule: " + cellularRuleName (currentCellularRule));
+        repaint();
+        return;
+    }
+
+    if (button == &caBirthButton)
+    {
+        static constexpr std::array<CellularRuleRange, 5> options {{
+            { 4, 4 }, { 5, 5 }, { 5, 6 }, { 6, 7 }, { 4, 6 }
+        }};
+        auto currentIndex = 0;
+        for (int i = 0; i < (int) options.size(); ++i)
+            if (options[(size_t) i].min == currentCellularBirthRange.min && options[(size_t) i].max == currentCellularBirthRange.max)
+                currentIndex = i;
+        currentCellularBirthRange = options[(size_t) ((currentIndex + 1) % (int) options.size())];
+        caBirthButton.setButtonText (cellularRangeLabel ("Birth", currentCellularBirthRange));
+        repaint();
+        return;
+    }
+
+    if (button == &caSurviveButton)
+    {
+        static constexpr std::array<CellularRuleRange, 5> options {{
+            { 3, 4 }, { 4, 5 }, { 5, 7 }, { 4, 6 }, { 5, 6 }
+        }};
+        auto currentIndex = 0;
+        for (int i = 0; i < (int) options.size(); ++i)
+            if (options[(size_t) i].min == currentCellularSurviveRange.min && options[(size_t) i].max == currentCellularSurviveRange.max)
+                currentIndex = i;
+        currentCellularSurviveRange = options[(size_t) ((currentIndex + 1) % (int) options.size())];
+        caSurviveButton.setButtonText (cellularRangeLabel ("Stay", currentCellularSurviveRange));
+        repaint();
+        return;
+    }
+
     if (button == &mixerToggleButton)
     {
         mixerVisible = ! mixerVisible;
@@ -4538,6 +5124,45 @@ void MainComponent::buttonClicked (juce::Button* button)
 
     for (int strip = 0; strip < (int) mixerStrips.size(); ++strip)
     {
+        auto clearSlot = [this, strip] (PluginSlotKind slotKind)
+        {
+            auto& slot = getHostedPluginSlot (strip, slotKind);
+            if (slot.instance != nullptr)
+                slot.instance->releaseResources();
+
+            const auto slotIndex = [slotKind]
+            {
+                switch (slotKind)
+                {
+                    case PluginSlotKind::midiFx: return 0;
+                    case PluginSlotKind::instrument: return 1;
+                    case PluginSlotKind::effectA: return 2;
+                    case PluginSlotKind::effectB: return 3;
+                    case PluginSlotKind::effectC: return 4;
+                    case PluginSlotKind::effectD: return 5;
+                }
+                return 0;
+            }();
+
+            mixerStrips[(size_t) strip].pluginWindows[(size_t) slotIndex].reset();
+            slot = {};
+            slot.buttonText = "Empty";
+        };
+
+        auto swapEffects = [this, strip] (PluginSlotKind firstKind, PluginSlotKind secondKind)
+        {
+            auto& first = getHostedPluginSlot (strip, firstKind);
+            auto& second = getHostedPluginSlot (strip, secondKind);
+            if (first.instance == nullptr && second.instance == nullptr)
+                return;
+
+            const auto firstIndex = (int) firstKind - (int) PluginSlotKind::midiFx;
+            const auto secondIndex = (int) secondKind - (int) PluginSlotKind::midiFx;
+            mixerStrips[(size_t) strip].pluginWindows[(size_t) firstIndex].reset();
+            mixerStrips[(size_t) strip].pluginWindows[(size_t) secondIndex].reset();
+            std::swap (first, second);
+        };
+
         if (button == &mixerMidiFxGuiButtons[(size_t) strip])
         {
             showPluginEditor (strip, PluginSlotKind::midiFx);
@@ -4573,6 +5198,131 @@ void MainComponent::buttonClicked (juce::Button* button)
             showPluginEditor (strip, PluginSlotKind::effectD);
             return;
         }
+
+        const auto toggleBypass = [&] (PluginSlotKind slotKind)
+        {
+            auto& slot = getHostedPluginSlot (strip, slotKind);
+            if (slot.instance == nullptr)
+                return false;
+            slot.bypassed = ! slot.bypassed;
+            updateMixerButtons();
+            return true;
+        };
+
+        if (button == &mixerMidiFxBypassButtons[(size_t) strip] && toggleBypass (PluginSlotKind::midiFx)) return;
+        if (button == &mixerInstrumentBypassButtons[(size_t) strip] && toggleBypass (PluginSlotKind::instrument)) return;
+        if (button == &mixerEffectABypassButtons[(size_t) strip] && toggleBypass (PluginSlotKind::effectA)) return;
+        if (button == &mixerEffectBBypassButtons[(size_t) strip] && toggleBypass (PluginSlotKind::effectB)) return;
+        if (button == &mixerEffectCBypassButtons[(size_t) strip] && toggleBypass (PluginSlotKind::effectC)) return;
+        if (button == &mixerEffectDBypassButtons[(size_t) strip] && toggleBypass (PluginSlotKind::effectD)) return;
+
+        if (button == &mixerMidiFxRemoveButtons[(size_t) strip]) { clearSlot (PluginSlotKind::midiFx); updateMixerButtons(); return; }
+        if (button == &mixerInstrumentRemoveButtons[(size_t) strip]) { clearSlot (PluginSlotKind::instrument); updateMixerButtons(); return; }
+        if (button == &mixerEffectARemoveButtons[(size_t) strip]) { clearSlot (PluginSlotKind::effectA); updateMixerButtons(); return; }
+        if (button == &mixerEffectBRemoveButtons[(size_t) strip]) { clearSlot (PluginSlotKind::effectB); updateMixerButtons(); return; }
+        if (button == &mixerEffectCRemoveButtons[(size_t) strip]) { clearSlot (PluginSlotKind::effectC); updateMixerButtons(); return; }
+        if (button == &mixerEffectDRemoveButtons[(size_t) strip]) { clearSlot (PluginSlotKind::effectD); updateMixerButtons(); return; }
+
+        if (button == &mixerEffectBUpButtons[(size_t) strip]) { swapEffects (PluginSlotKind::effectA, PluginSlotKind::effectB); updateMixerButtons(); return; }
+        if (button == &mixerEffectCUpButtons[(size_t) strip]) { swapEffects (PluginSlotKind::effectB, PluginSlotKind::effectC); updateMixerButtons(); return; }
+        if (button == &mixerEffectDUpButtons[(size_t) strip]) { swapEffects (PluginSlotKind::effectC, PluginSlotKind::effectD); updateMixerButtons(); return; }
+        if (button == &mixerEffectADownButtons[(size_t) strip]) { swapEffects (PluginSlotKind::effectA, PluginSlotKind::effectB); updateMixerButtons(); return; }
+        if (button == &mixerEffectBDownButtons[(size_t) strip]) { swapEffects (PluginSlotKind::effectB, PluginSlotKind::effectC); updateMixerButtons(); return; }
+        if (button == &mixerEffectCDownButtons[(size_t) strip]) { swapEffects (PluginSlotKind::effectC, PluginSlotKind::effectD); updateMixerButtons(); return; }
+    }
+
+    if (button == &parameterPickerButton && selectedCell != nullptr && selectedCell->type == GlyphType::parameter)
+    {
+        juce::PopupMenu menu;
+        int itemId = 1;
+        std::vector<juce::String> parameterCodes;
+
+        juce::PopupMenu routedStripMenu;
+        for (auto slotKind : { PluginSlotKind::instrument, PluginSlotKind::effectA, PluginSlotKind::effectB,
+                               PluginSlotKind::effectC, PluginSlotKind::effectD, PluginSlotKind::midiFx })
+        {
+            juce::PopupMenu slotMenu;
+            for (int strip = 0; strip < (int) mixerStrips.size(); ++strip)
+            {
+                const auto entries = getParameterChoicesForSlot (strip, slotKind);
+                for (const auto& entry : entries)
+                {
+                    auto parameterToken = entry.upToFirstOccurrenceOf (" ", false, false);
+                    if (const auto idStart = entry.indexOf ("[id:"); idStart >= 0)
+                    {
+                        const auto idText = entry.fromFirstOccurrenceOf ("[id:", false, false)
+                                                .upToLastOccurrenceOf ("]", false, false);
+                        parameterToken = "id:" + idText;
+                    }
+
+                    parameterCodes.push_back (mixerSlotPrefix (slotKind).toLowerCase() + ":" + parameterToken + "=0.50");
+                    slotMenu.addItem (itemId++, "Strip " + juce::String (strip + 1) + " - " + entry);
+                }
+            }
+
+            if (slotMenu.getNumItems() > 0)
+                routedStripMenu.addSubMenu (mixerSlotPrefix (slotKind), slotMenu);
+        }
+
+        if (routedStripMenu.getNumItems() > 0)
+            menu.addSubMenu ("Routed Strip", routedStripMenu);
+
+        for (int strip = 0; strip < (int) mixerStrips.size(); ++strip)
+        {
+            juce::PopupMenu stripMenu;
+
+            for (auto slotKind : { PluginSlotKind::instrument, PluginSlotKind::effectA, PluginSlotKind::effectB,
+                                   PluginSlotKind::effectC, PluginSlotKind::effectD, PluginSlotKind::midiFx })
+            {
+                const auto entries = getParameterChoicesForSlot (strip, slotKind);
+                if (entries.isEmpty())
+                    continue;
+
+                juce::PopupMenu slotMenu;
+                for (const auto& entry : entries)
+                {
+                    auto parameterToken = entry.upToFirstOccurrenceOf (" ", false, false);
+                    if (const auto idStart = entry.indexOf ("[id:"); idStart >= 0)
+                    {
+                        const auto idText = entry.fromFirstOccurrenceOf ("[id:", false, false)
+                                                .upToLastOccurrenceOf ("]", false, false);
+                        parameterToken = "id:" + idText;
+                    }
+
+                    parameterCodes.push_back ("s" + juce::String (strip + 1) + ":"
+                                              + mixerSlotPrefix (slotKind).toLowerCase() + ":"
+                                              + parameterToken + "=0.50");
+                    slotMenu.addItem (itemId++, entry);
+                }
+
+                stripMenu.addSubMenu (mixerSlotPrefix (slotKind), slotMenu);
+            }
+
+            if (stripMenu.getNumItems() > 0)
+                menu.addSubMenu ("Strip " + juce::String (strip + 1), stripMenu);
+        }
+
+        if (parameterCodes.empty())
+        {
+            menu.addItem (1, "No plugin parameters available", false, false);
+            menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&parameterPickerButton), [] (int) {});
+            return;
+        }
+
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&parameterPickerButton),
+                            [this, parameterCodes] (int result)
+                            {
+                                if (result <= 0 || result > (int) parameterCodes.size() || selectedCell == nullptr)
+                                    return;
+
+                                selectedCell->code = parameterCodes[(size_t) (result - 1)];
+                                recompileCell (*selectedCell);
+                                codeEditor.setText (selectedCell->code, juce::dontSendNotification);
+                                publishPatchSnapshot();
+                                updateCellButtons();
+                                renderInspector();
+                            });
+        return;
     }
 
     if (button == &saveButton)
@@ -4698,6 +5448,8 @@ void MainComponent::buttonClicked (juce::Button* button)
                                         auto& slot = getHostedPluginSlot (strip, slotKind);
                                         if (slot.instance != nullptr)
                                             slot.instance->releaseResources();
+                                        const auto slotIndex = (int) slotKind - (int) PluginSlotKind::midiFx;
+                                        mixerStrips[(size_t) strip].pluginWindows[(size_t) slotIndex].reset();
                                         slot = {};
                                         slot.buttonText = "Empty";
                                         updateMixerButtons();
@@ -4756,6 +5508,7 @@ void MainComponent::renderInspector()
         glyphValueLabel.setText ("", juce::dontSendNotification);
         labelEditor.setText ("");
         codeEditor.setText ("");
+        parameterPickerButton.setVisible (false);
         return;
     }
 
@@ -4765,6 +5518,7 @@ void MainComponent::renderInspector()
     glyphValueLabel.setText ("Glyph " + glyphTypeToString (selectedCell->type), juce::dontSendNotification);
     labelEditor.setText (selectedCell->label, juce::dontSendNotification);
     codeEditor.setText (selectedCell->code, juce::dontSendNotification);
+    parameterPickerButton.setVisible (isPluginMode() && selectedCell->type == GlyphType::parameter);
 }
 
 void MainComponent::updateCellButtons()
@@ -4780,6 +5534,8 @@ void MainComponent::updateCellButtons()
         button->code = visibleCell != nullptr ? visibleCell->code : juce::String();
         button->hiddenLayerBadges.clear();
         button->hiddenLayerBadgeColours.clear();
+        button->overlayBadges.clear();
+        button->overlayBadgeColours.clear();
         button->hasAnyLayerContent = false;
         button->hasHiddenLayerContent = false;
         button->isActiveColumn = false;
@@ -4788,6 +5544,7 @@ void MainComponent::updateCellButtons()
         button->showsNextStep = false;
         button->isAutomataActive = false;
         button->isAutomataNewborn = false;
+        button->pluginActivity = 0.0f;
         button->snakeDirectionX = 0;
         button->snakeDirectionY = 0;
         button->snakeDirectionLayer = 0;
@@ -4873,6 +5630,62 @@ void MainComponent::updateCellButtons()
             const auto index = (size_t) getCellIndex (visibleLayer, button->row, button->col);
             button->isAutomataActive = transportSnapshot.automataCurrent[index] != 0;
             button->isAutomataNewborn = button->isAutomataActive && transportSnapshot.automataPrevious[index] == 0;
+        }
+
+        if (visibleCell != nullptr)
+        {
+            switch (visibleCell->type)
+            {
+                case GlyphType::route:
+                {
+                    const auto routeIndex = juce::jlimit (1, 3, visibleCell->code.getIntValue());
+                    button->overlayBadges.add ("S" + juce::String (routeIndex));
+                    button->overlayBadgeColours.add (juce::Colour (0xff7fe8ff));
+                    if (isPluginMode())
+                        button->pluginActivity = publishedMixerLevels[(size_t) (routeIndex - 1)].load();
+                    break;
+                }
+                case GlyphType::channel:
+                {
+                    const auto channel = juce::jlimit (1, 16, visibleCell->code.getIntValue());
+                    button->overlayBadges.add ("CH" + juce::String (channel));
+                    button->overlayBadgeColours.add (juce::Colour (0xff57b6ff));
+                    break;
+                }
+                case GlyphType::cc:
+                {
+                    int ccNumber = 0, ccValue = 0;
+                    parseCcSpec (visibleCell->code, ccNumber, ccValue);
+                    button->overlayBadges.add ("CC" + juce::String (ccNumber));
+                    button->overlayBadgeColours.add (juce::Colour (0xff6bffd5));
+                    break;
+                }
+                case GlyphType::parameter:
+                {
+                    auto explicitStripIndex = -1;
+                    juce::String slotQualifier, parameterToken;
+                    auto normalizedValue = 0.0f;
+                    auto hasExplicitValue = false;
+                    parseParameterSpec (visibleCell->code, explicitStripIndex, slotQualifier, parameterToken, normalizedValue, hasExplicitValue);
+                    button->overlayBadges.add (explicitStripIndex >= 0 ? "S" + juce::String (explicitStripIndex + 1) : "AUTO");
+                    if (slotQualifier.isNotEmpty())
+                        button->overlayBadges.add (slotQualifier.toUpperCase());
+                    button->overlayBadgeColours.add (juce::Colour (0xffffd46b));
+                    if (slotQualifier.isNotEmpty())
+                        button->overlayBadgeColours.add (juce::Colour (0xffffc15b));
+                    if (isPluginMode())
+                    {
+                        if (explicitStripIndex >= 0)
+                            button->pluginActivity = publishedMixerLevels[(size_t) explicitStripIndex].load();
+                        else
+                            button->pluginActivity = juce::jmax (publishedMixerLevels[0].load(),
+                                                                 juce::jmax (publishedMixerLevels[1].load(), publishedMixerLevels[2].load()));
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
         }
 
         button->repaint();
@@ -5010,6 +5823,10 @@ MainComponent::ScoreResult MainComponent::evaluateScore (double timeSeconds) con
                                         timeSeconds);
     result.transportPhase = transportSnapshot.transportPhase;
     result.activeLayer = visibleLayer;
+    result.cellularRule = (int) currentCellularRule;
+    result.pluginMode = isPluginMode();
+    for (int i = 0; i < 3; ++i)
+        result.mixerLevels[(size_t) i] = publishedMixerLevels[(size_t) i].load();
     result.mode = currentMode;
     result.harmonySpaceKeyCenter = harmonySpaceKeyCenter;
     result.harmonySpaceConstraintMode = harmonySpaceConstraintMode;
@@ -5246,6 +6063,7 @@ void MainComponent::triggerSynthVoice (float midiNote,
 
     *voice = {};
     voice->active = true;
+    voice->stripIndex = juce::jlimit (0, (int) mixerStrips.size() - 1, preferredStrip >= 0 ? preferredStrip : resolvePreferredStrip (preferredStrip, midiNote));
     voice->frequency = frequency;
     voice->amplitude = juce::jlimit (0.0f, harmonySpaceMode ? 0.26f : 0.45f, amplitude);
     voice->env = 1.0f;
@@ -5296,6 +6114,7 @@ void MainComponent::triggerDrumVoice (DrumType type,
 
     *voice = {};
     voice->active = true;
+    voice->stripIndex = juce::jlimit (0, (int) mixerStrips.size() - 1, preferredStrip >= 0 ? preferredStrip : 2);
     voice->type = type;
     voice->amplitude = juce::jlimit (0.0f, 0.4f, amplitude);
     voice->env = 1.0f;
@@ -5333,6 +6152,38 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
     const auto beat = timeSeconds * (snapshot.bpm / 60.0);
     const auto samplesPerTick = juce::jmax (1, (int) std::round (currentSampleRate * 60.0 / (snapshot.bpm * 4.0)));
     const auto harmonySpaceMode = currentMode == AppMode::harmonySpace;
+    const auto quantizeHarmonySpacePitch = [this] (float midiNote, int chordIndex)
+    {
+        if (currentMode != AppMode::harmonySpace || harmonySpaceConstraintMode == 0)
+            return midiNote;
+
+        juce::Array<int> allowedPitchClasses;
+        static constexpr int majorSet[] = { 0, 2, 4, 5, 7, 9, 11 };
+        static constexpr int chordSets[][4] = {
+            { 0, 4, 7, -1 },
+            { 0, 3, 7, -1 },
+            { 0, 4, 8, -1 },
+            { 0, 5, 7, -1 },
+            { 0, 2, 7, -1 },
+            { 0, 7, 10, -1 },
+            { 0, 5, 9, -1 }
+        };
+
+        if (harmonySpaceConstraintMode >= 1)
+            for (auto degree : majorSet)
+                allowedPitchClasses.addIfNotAlreadyThere (wrapPitchClass (harmonySpaceKeyCenter + degree));
+
+        if (harmonySpaceConstraintMode >= 2)
+        {
+            allowedPitchClasses.clearQuick();
+            const auto clampedChord = juce::jlimit (0, 6, chordIndex);
+            for (auto degree : chordSets[clampedChord])
+                if (degree >= 0)
+                    allowedPitchClasses.addIfNotAlreadyThere (wrapPitchClass (harmonySpaceKeyCenter + degree));
+        }
+
+        return snapMidiToPitchClasses (midiNote, allowedPitchClasses);
+    };
 
     if (currentMode == AppMode::cellularGrid)
     {
@@ -5915,7 +6766,7 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                                                 const auto voiceBrightness = juce::jlimit (0.12f, 0.78f, (float) (localBrightness + noteIndex * 0.03));
                                                 const auto voiceWaveform = juce::jlimit (0.04f, 0.42f, (float) (localWaveformMix + noteIndex * 0.025));
                                                 const auto voiceDecay = (float) (localDecayScale * 1.95);
-                                                triggerSynthVoice ((float) (basePitch + interval),
+                                                triggerSynthVoice (quantizeHarmonySpacePitch ((float) (basePitch + interval), chordIndex),
                                                                    voiceAmp,
                                                                    (float) localNoiseMix,
                                                                    voiceBrightness,
@@ -5945,7 +6796,7 @@ void MainComponent::processAudioTick (const PatchSnapshot& snapshot, double time
                                                 const auto voiceBrightness = juce::jlimit (0.12f, 0.78f, (float) (localBrightness + noteIndex * 0.03));
                                                 const auto voiceWaveform = juce::jlimit (0.04f, 0.42f, (float) (localWaveformMix + noteIndex * 0.025));
                                                 const auto voiceDecay = (float) (localDecayScale * (axisRole == 0 ? 1.45 : 1.7));
-                                                triggerSynthVoice ((float) (basePitch + interval),
+                                                triggerSynthVoice (quantizeHarmonySpacePitch ((float) (basePitch + interval), chordIndex),
                                                                    voiceAmp,
                                                                    (float) localNoiseMix,
                                                                    voiceBrightness,
@@ -6391,6 +7242,154 @@ float MainComponent::renderDrumSample() noexcept
     return output;
 }
 
+void MainComponent::renderInternalMix (float& left, float& right) noexcept
+{
+    left = 0.0f;
+    right = 0.0f;
+
+    std::array<float, 3> stripPeaks {};
+
+    for (auto& voice : synthVoices)
+    {
+        if (! voice.active)
+            continue;
+
+        if (voice.delaySamples > 0)
+        {
+            --voice.delaySamples;
+            continue;
+        }
+
+        const auto harmonySpaceMode = currentMode == AppMode::harmonySpace;
+        voice.phaseA += voice.frequency / (float) currentSampleRate;
+        voice.phaseB += (voice.frequency * voice.detuneRatio) / (float) currentSampleRate;
+        voice.phaseA -= std::floor (voice.phaseA);
+        voice.phaseB -= std::floor (voice.phaseB);
+
+        const auto sine = std::sin (voice.phaseA * juce::MathConstants<float>::twoPi);
+        const auto tri = 1.0f - 4.0f * std::abs (voice.phaseB - 0.5f);
+        const auto saw = voice.phaseB * 2.0f - 1.0f;
+        const auto harmonic = harmonySpaceMode ? (sine * 0.70f + tri * 0.25f + saw * 0.05f)
+                                               : (tri * 0.55f + saw * 0.45f);
+        const auto tonal = juce::jmap (voice.waveformMix, sine, harmonic);
+        const auto noise = ((random.nextFloat() * 2.0f) - 1.0f) * voice.noiseMix;
+        voice.attack = juce::jmin (1.0f, voice.attack + voice.attackIncrement);
+        const auto raw = (tonal * (1.0f - voice.noiseMix * (harmonySpaceMode ? 0.18f : 0.45f)) + noise) * voice.amplitude * voice.env * voice.attack;
+
+        voice.filterState += (raw - voice.filterState) * voice.filterCoeff;
+        float sample = 0.0f;
+        if (harmonySpaceMode)
+        {
+            voice.filterStateB += (voice.filterState - voice.filterStateB) * voice.filterCoeff * 0.42f;
+            sample = std::tanh (voice.filterStateB * 1.12f) * 0.92f;
+        }
+        else
+        {
+            sample = voice.filterState;
+        }
+
+        const auto stripIndex = juce::jlimit (0, (int) mixerStrips.size() - 1, voice.stripIndex);
+        const auto& strip = mixerStrips[(size_t) stripIndex];
+        const auto leftGain = strip.volume * (strip.pan <= 0.0f ? 1.0f : 1.0f - strip.pan);
+        const auto rightGain = strip.volume * (strip.pan >= 0.0f ? 1.0f : 1.0f + strip.pan);
+        left += sample * leftGain;
+        right += sample * rightGain;
+        stripPeaks[(size_t) stripIndex] = juce::jmax (stripPeaks[(size_t) stripIndex], std::abs (sample) * juce::jmax (leftGain, rightGain));
+
+        voice.env *= voice.decayPerSample;
+        if (voice.env < 0.0005f)
+            voice.active = false;
+    }
+
+    for (auto& voice : drumVoices)
+    {
+        if (! voice.active)
+            continue;
+
+        if (voice.delaySamples > 0)
+        {
+            --voice.delaySamples;
+            continue;
+        }
+
+        float sample = 0.0f;
+        const auto noise = random.nextFloat() * 2.0f - 1.0f;
+
+        switch (voice.type)
+        {
+            case DrumType::kick:
+            {
+                voice.phase += voice.frequency / (float) currentSampleRate;
+                voice.phase -= std::floor (voice.phase);
+                const auto pitchEnv = voice.sweep * voice.env * voice.env;
+                voice.frequency = juce::jlimit (35.0f, 180.0f, voice.frequency * 0.9985f + pitchEnv * 0.0015f);
+                const auto body = std::sin (voice.phase * juce::MathConstants<float>::twoPi);
+                const auto click = noise * voice.env * 0.08f;
+                sample = std::tanh ((body * 1.35f + click) * voice.amplitude * 1.8f);
+                break;
+            }
+            case DrumType::snare:
+            {
+                voice.phase += voice.frequency / (float) currentSampleRate;
+                voice.phaseB += (voice.frequency * 1.47f) / (float) currentSampleRate;
+                voice.phase -= std::floor (voice.phase);
+                voice.phaseB -= std::floor (voice.phaseB);
+                const auto body = std::sin (voice.phase * juce::MathConstants<float>::twoPi) * 0.6f
+                                + std::sin (voice.phaseB * juce::MathConstants<float>::twoPi) * 0.3f;
+                sample = (noise * 0.78f + body * 0.34f) * voice.env * voice.amplitude;
+                break;
+            }
+            case DrumType::hat:
+            {
+                voice.phase += voice.frequency / (float) currentSampleRate;
+                voice.phaseB += (voice.frequency * 1.37f) / (float) currentSampleRate;
+                voice.phase -= std::floor (voice.phase);
+                voice.phaseB -= std::floor (voice.phaseB);
+                const auto metal = ((voice.phase > 0.5f ? 1.0f : -1.0f)
+                                  + (voice.phaseB > 0.5f ? 1.0f : -1.0f)) * 0.5f;
+                sample = (noise * 0.72f + metal * 0.48f) * voice.env * voice.amplitude;
+                sample -= voice.noiseState;
+                voice.noiseState += (sample - voice.noiseState) * 0.16f;
+                break;
+            }
+            case DrumType::clap:
+            {
+                if (voice.burstCounter <= 0)
+                {
+                    ++voice.burstStage;
+                    voice.burstCounter = voice.burstStage < 3 ? juce::jmax (1, (int) (0.012f * currentSampleRate)) : juce::jmax (1, (int) (0.05f * currentSampleRate));
+                }
+
+                --voice.burstCounter;
+                const auto burstEnv = voice.burstStage < 3 ? 1.0f : 0.55f;
+                sample = noise * burstEnv * voice.env * voice.amplitude;
+                sample -= voice.noiseState;
+                voice.noiseState += (sample - voice.noiseState) * 0.09f;
+                break;
+            }
+        }
+
+        const auto stripIndex = juce::jlimit (0, (int) mixerStrips.size() - 1, voice.stripIndex);
+        const auto& strip = mixerStrips[(size_t) stripIndex];
+        const auto leftGain = strip.volume * (strip.pan <= 0.0f ? 1.0f : 1.0f - strip.pan);
+        const auto rightGain = strip.volume * (strip.pan >= 0.0f ? 1.0f : 1.0f + strip.pan);
+        left += sample * leftGain;
+        right += sample * rightGain;
+        stripPeaks[(size_t) stripIndex] = juce::jmax (stripPeaks[(size_t) stripIndex], std::abs (sample) * juce::jmax (leftGain, rightGain));
+
+        voice.env *= voice.decayPerSample;
+        if (voice.env < 0.0005f)
+            voice.active = false;
+    }
+
+    for (int stripIndex = 0; stripIndex < (int) mixerStrips.size(); ++stripIndex)
+    {
+        const auto previousLevel = publishedMixerLevels[(size_t) stripIndex].load (std::memory_order_relaxed);
+        const auto smoothedLevel = juce::jmax (stripPeaks[(size_t) stripIndex], previousLevel * 0.90f);
+        publishedMixerLevels[(size_t) stripIndex].store (juce::jlimit (0.0f, 1.0f, smoothedLevel), std::memory_order_relaxed);
+    }
+}
+
 float MainComponent::evaluateAudioForSnapshot (const PatchSnapshot&, double) noexcept
 {
     return renderSynthSample() + renderDrumSample();
@@ -6590,28 +7589,32 @@ void MainComponent::advanceAutomataGeneration (const PatchSnapshot& snapshot) no
                                                || cell.type == GlyphType::octave
                                                || cell.type == GlyphType::audio
                                                || cell.type == GlyphType::wormhole;
-                const auto phase = juce::jmax (0, lastAdvancedTick.load()) & 3;
+                const auto birthMin = juce::jlimit (0, 26, currentCellularBirthRange.min);
+                const auto birthMax = juce::jlimit (birthMin, 26, currentCellularBirthRange.max);
+                const auto surviveMin = juce::jlimit (0, 26, currentCellularSurviveRange.min);
+                const auto surviveMax = juce::jlimit (surviveMin, 26, currentCellularSurviveRange.max);
 
-                auto staysAlive = false;
-                auto becomesAlive = false;
+                auto staysAlive = alive && neighbours >= surviveMin && neighbours <= surviveMax;
+                auto becomesAlive = ! alive && neighbours >= birthMin && neighbours <= birthMax;
 
-                switch (phase)
+                // Each named rule keeps a small personality on top of the explicit ranges.
+                switch (currentCellularRule)
                 {
-                    case 0:
-                        staysAlive = alive && (neighbours == 4 || neighbours == 5);
-                        becomesAlive = ! alive && neighbours == 5;
+                    case CellularRule::bloom:
+                        if (musicallyInteresting && ! alive && neighbours == birthMax + 1)
+                            becomesAlive = true;
                         break;
-                    case 1:
-                        staysAlive = alive && (neighbours == 4 || neighbours == 5 || neighbours == 6);
-                        becomesAlive = ! alive && (neighbours == 5 || neighbours == 6);
+                    case CellularRule::maze:
+                        if (alive && neighbours == surviveMax + 1)
+                            staysAlive = true;
                         break;
-                    case 2:
-                        staysAlive = alive && (neighbours == 3 || neighbours == 4 || neighbours == 5);
-                        becomesAlive = ! alive && (neighbours == 4 || neighbours == 5);
+                    case CellularRule::coral:
+                        if (! alive && musicallyInteresting && neighbours == juce::jmax (0, birthMin - 1))
+                            becomesAlive = true;
                         break;
-                    default:
-                        staysAlive = alive && (neighbours == 5 || neighbours == 6);
-                        becomesAlive = ! alive && neighbours == 6;
+                    case CellularRule::pulse:
+                        if (alive && ((layer + row + col + juce::jmax (0, lastAdvancedTick.load())) % 2) == 0 && neighbours == surviveMin)
+                            staysAlive = true;
                         break;
                 }
 
@@ -6989,6 +7992,12 @@ bool MainComponent::savePatchToFile (const juce::File& file)
     root->setProperty ("harmonySpaceKeyCenter", harmonySpaceKeyCenter);
     root->setProperty ("harmonySpaceConstraintMode", harmonySpaceConstraintMode);
     root->setProperty ("harmonySpaceGestureRecordEnabled", harmonySpaceGestureRecordEnabled);
+    root->setProperty ("cellularRule", (int) currentCellularRule);
+    root->setProperty ("modePresetIndex", modePresetIndices[(size_t) modeIndex (currentMode)]);
+    root->setProperty ("cellularBirthMin", currentCellularBirthRange.min);
+    root->setProperty ("cellularBirthMax", currentCellularBirthRange.max);
+    root->setProperty ("cellularSurviveMin", currentCellularSurviveRange.min);
+    root->setProperty ("cellularSurviveMax", currentCellularSurviveRange.max);
 
     juce::var mixerStripsVar { juce::Array<juce::var>() };
     auto* mixerStripsArray = mixerStripsVar.getArray();
@@ -6999,16 +8008,22 @@ bool MainComponent::savePatchToFile (const juce::File& file)
         stripObject->setProperty ("volume", strip.volume);
         stripObject->setProperty ("pan", strip.pan);
         stripObject->setProperty ("midiFxPath", strip.midiFx.pluginPath);
+        stripObject->setProperty ("midiFxBypassed", strip.midiFx.bypassed);
         stripObject->setProperty ("midiFxState", serialisePluginState (strip.midiFx));
         stripObject->setProperty ("instrumentPath", strip.instrument.pluginPath);
+        stripObject->setProperty ("instrumentBypassed", strip.instrument.bypassed);
         stripObject->setProperty ("instrumentState", serialisePluginState (strip.instrument));
         stripObject->setProperty ("effectAPath", strip.effectA.pluginPath);
+        stripObject->setProperty ("effectABypassed", strip.effectA.bypassed);
         stripObject->setProperty ("effectAState", serialisePluginState (strip.effectA));
         stripObject->setProperty ("effectBPath", strip.effectB.pluginPath);
+        stripObject->setProperty ("effectBBypassed", strip.effectB.bypassed);
         stripObject->setProperty ("effectBState", serialisePluginState (strip.effectB));
         stripObject->setProperty ("effectCPath", strip.effectC.pluginPath);
+        stripObject->setProperty ("effectCBypassed", strip.effectC.bypassed);
         stripObject->setProperty ("effectCState", serialisePluginState (strip.effectC));
         stripObject->setProperty ("effectDPath", strip.effectD.pluginPath);
+        stripObject->setProperty ("effectDBypassed", strip.effectD.bypassed);
         stripObject->setProperty ("effectDState", serialisePluginState (strip.effectD));
         mixerStripsArray->add (juce::var (stripObject.release()));
     }
@@ -7145,6 +8160,14 @@ bool MainComponent::loadPatchFromFile (const juce::File& file)
     harmonySpaceKeyCenter = juce::jlimit (0, 11, (int) getPropertyOr ("harmonySpaceKeyCenter", 0));
     harmonySpaceConstraintMode = juce::jlimit (0, 2, (int) getPropertyOr ("harmonySpaceConstraintMode", 0));
     harmonySpaceGestureRecordEnabled = (bool) getPropertyOr ("harmonySpaceGestureRecordEnabled", false);
+    currentCellularRule = (CellularRule) juce::jlimit (0, 3, (int) getPropertyOr ("cellularRule", (int) CellularRule::bloom));
+    modePresetIndices[(size_t) modeIndex (currentMode)] = juce::jlimit (0, 2, (int) getPropertyOr ("modePresetIndex", 0));
+    currentCellularBirthRange = { (int) getPropertyOr ("cellularBirthMin", 5), (int) getPropertyOr ("cellularBirthMax", 5) };
+    currentCellularSurviveRange = { (int) getPropertyOr ("cellularSurviveMin", 4), (int) getPropertyOr ("cellularSurviveMax", 5) };
+    caRuleButton.setButtonText ("Rule: " + cellularRuleName (currentCellularRule));
+    presetButton.setButtonText ("Preset " + juce::String (modePresetIndices[(size_t) modeIndex (currentMode)] + 1));
+    caBirthButton.setButtonText (cellularRangeLabel ("Birth", currentCellularBirthRange));
+    caSurviveButton.setButtonText (cellularRangeLabel ("Stay", currentCellularSurviveRange));
     harmonySpaceGesturePoints.clear();
     if (auto* gestureArray = root->getProperty ("harmonySpaceGesturePoints").getArray())
     {
@@ -7179,39 +8202,51 @@ bool MainComponent::loadPatchFromFile (const juce::File& file)
                 const auto effectBState = stripObject->getProperty ("effectBState").toString();
                 const auto midiFxPath = stripObject->getProperty ("midiFxPath").toString();
                 const auto midiFxState = stripObject->getProperty ("midiFxState").toString();
+                const auto midiFxBypassed = (bool) stripObject->getProperty ("midiFxBypassed");
                 const auto effectCPath = stripObject->getProperty ("effectCPath").toString();
                 const auto effectCState = stripObject->getProperty ("effectCState").toString();
+                const auto effectABypassed = (bool) stripObject->getProperty ("effectABypassed");
+                const auto effectBBypassed = (bool) stripObject->getProperty ("effectBBypassed");
+                const auto effectCBypassed = (bool) stripObject->getProperty ("effectCBypassed");
                 const auto effectDPath = stripObject->getProperty ("effectDPath").toString();
                 const auto effectDState = stripObject->getProperty ("effectDState").toString();
+                const auto effectDBypassed = (bool) stripObject->getProperty ("effectDBypassed");
+                const auto instrumentBypassed = (bool) stripObject->getProperty ("instrumentBypassed");
                 if (midiFxPath.isNotEmpty())
                 {
                     loadPluginIntoSlot (stripIndex, PluginSlotKind::midiFx, juce::File (midiFxPath));
                     restorePluginState (mixerStrips[(size_t) stripIndex].midiFx, midiFxState);
+                    mixerStrips[(size_t) stripIndex].midiFx.bypassed = midiFxBypassed;
                 }
                 if (instrumentPath.isNotEmpty())
                 {
                     loadPluginIntoSlot (stripIndex, PluginSlotKind::instrument, juce::File (instrumentPath));
                     restorePluginState (mixerStrips[(size_t) stripIndex].instrument, instrumentState);
+                    mixerStrips[(size_t) stripIndex].instrument.bypassed = instrumentBypassed;
                 }
                 if (effectAPath.isNotEmpty())
                 {
                     loadPluginIntoSlot (stripIndex, PluginSlotKind::effectA, juce::File (effectAPath));
                     restorePluginState (mixerStrips[(size_t) stripIndex].effectA, effectAState);
+                    mixerStrips[(size_t) stripIndex].effectA.bypassed = effectABypassed;
                 }
                 if (effectBPath.isNotEmpty())
                 {
                     loadPluginIntoSlot (stripIndex, PluginSlotKind::effectB, juce::File (effectBPath));
                     restorePluginState (mixerStrips[(size_t) stripIndex].effectB, effectBState);
+                    mixerStrips[(size_t) stripIndex].effectB.bypassed = effectBBypassed;
                 }
                 if (effectCPath.isNotEmpty())
                 {
                     loadPluginIntoSlot (stripIndex, PluginSlotKind::effectC, juce::File (effectCPath));
                     restorePluginState (mixerStrips[(size_t) stripIndex].effectC, effectCState);
+                    mixerStrips[(size_t) stripIndex].effectC.bypassed = effectCBypassed;
                 }
                 if (effectDPath.isNotEmpty())
                 {
                     loadPluginIntoSlot (stripIndex, PluginSlotKind::effectD, juce::File (effectDPath));
                     restorePluginState (mixerStrips[(size_t) stripIndex].effectD, effectDState);
+                    mixerStrips[(size_t) stripIndex].effectD.bypassed = effectDBypassed;
                 }
             }
         }

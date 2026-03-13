@@ -35,6 +35,20 @@ public:
         harmonySpace
     };
 
+    enum class CellularRule
+    {
+        bloom,
+        maze,
+        coral,
+        pulse
+    };
+
+    struct CellularRuleRange
+    {
+        int min = 4;
+        int max = 5;
+    };
+
     MainComponent();
     ~MainComponent() override;
 
@@ -172,6 +186,7 @@ private:
     struct SynthVoice
     {
         bool active = false;
+        int stripIndex = 1;
         float frequency = 220.0f;
         float amplitude = 0.0f;
         float phaseA = 0.0f;
@@ -201,6 +216,7 @@ private:
     struct DrumVoice
     {
         bool active = false;
+        int stripIndex = 1;
         DrumType type = DrumType::kick;
         float amplitude = 0.0f;
         float env = 0.0f;
@@ -233,10 +249,13 @@ private:
         float energy = 0.0f;
         float transportPhase = 0.0f;
         int activeLayer = 0;
+        int cellularRule = 0;
         int harmonySpaceKeyCenter = 0;
         int harmonySpaceConstraintMode = 0;
         bool harmonySpaceGestureRecordEnabled = false;
+        bool pluginMode = false;
         AppMode mode = AppMode::glyphGrid;
+        std::array<float, 3> mixerLevels {};
         juce::Array<GridCellVisual> gridCells;
         juce::Array<VisualLine> lines;
         juce::Array<Snake> snakes;
@@ -264,6 +283,7 @@ private:
         std::unique_ptr<juce::AudioPluginInstance> instance;
         juce::String buttonText { "Empty" };
         juce::String pluginPath;
+        bool bypassed = false;
     };
 
     struct MixerStripState
@@ -281,7 +301,7 @@ private:
         juce::AudioBuffer<float> midiFxScratchBuffer;
         juce::MidiBuffer midiBuffer;
         std::vector<ScheduledMidiEvent> pendingMidi;
-        std::unique_ptr<juce::DocumentWindow> pluginWindow;
+        std::array<std::unique_ptr<juce::DocumentWindow>, 6> pluginWindows;
     };
 
     class SidebarButton final : public juce::TextButton
@@ -444,6 +464,8 @@ private:
         juce::String code;
         juce::StringArray hiddenLayerBadges;
         juce::Array<juce::Colour> hiddenLayerBadgeColours;
+        juce::StringArray overlayBadges;
+        juce::Array<juce::Colour> overlayBadgeColours;
         GlyphType type = GlyphType::empty;
         bool hasAnyLayerContent = false;
         bool hasHiddenLayerContent = false;
@@ -454,6 +476,7 @@ private:
         bool showsNextStep = false;
         bool isAutomataActive = false;
         bool isAutomataNewborn = false;
+        float pluginActivity = 0.0f;
         int snakeDirectionX = 0;
         int snakeDirectionY = 0;
         int snakeDirectionLayer = 0;
@@ -556,6 +579,7 @@ private:
                            int ccValue = -1) noexcept;
     float renderSynthSample() noexcept;
     float renderDrumSample() noexcept;
+    void renderInternalMix (float& left, float& right) noexcept;
     void initialisePluginHosting();
     void clearPluginProcessingState() noexcept;
     void preparePluginInstances (double sampleRate, int blockSize);
@@ -597,6 +621,7 @@ private:
     static bool isMidiFxPlugin (const juce::PluginDescription&) noexcept;
     static bool isInstrumentPlugin (const juce::PluginDescription&) noexcept;
     juce::Array<juce::PluginDescription> getPluginChoicesForSlot (PluginSlotKind) const;
+    juce::StringArray getParameterChoicesForSlot (int stripIndex, PluginSlotKind slotKind) const;
     void initialiseSnakes();
     void spawnSnake();
     void advanceSnakesToTick (int targetTick, const PatchSnapshot& snapshot);
@@ -635,6 +660,10 @@ private:
     FooterButton playButton { "Play", juce::Colour::fromFloatRGBA (0.66f, 1.0f, 0.10f, 1.0f) },
                  clearButton { "Clear Grid", juce::Colour::fromFloatRGBA (0.12f, 0.96f, 1.0f, 1.0f) },
                  spawnSnakeButton { "Spawn Snake", juce::Colour::fromFloatRGBA (1.0f, 0.32f, 0.88f, 1.0f) },
+                 presetButton { "Preset 1", juce::Colour::fromFloatRGBA (1.0f, 0.58f, 0.22f, 1.0f) },
+                 caRuleButton { "Rule: Bloom", juce::Colour::fromFloatRGBA (0.58f, 0.92f, 1.0f, 1.0f) },
+                 caBirthButton { "Birth 5-5", juce::Colour::fromFloatRGBA (0.88f, 1.0f, 0.30f, 1.0f) },
+                 caSurviveButton { "Stay 4-5", juce::Colour::fromFloatRGBA (0.22f, 1.0f, 0.82f, 1.0f) },
                  mixerToggleButton { "Mixer", juce::Colour::fromFloatRGBA (0.96f, 0.90f, 0.22f, 1.0f) },
                  saveButton { "Save", juce::Colour::fromFloatRGBA (1.0f, 0.68f, 0.16f, 1.0f) },
                  loadButton { "Load", juce::Colour::fromFloatRGBA (0.72f, 0.48f, 1.0f, 1.0f) },
@@ -657,6 +686,7 @@ private:
     juce::TextEditor labelEditor, codeEditor;
     juce::Label glyphValueLabel;
     juce::Label helpLabel;
+    juce::TextButton parameterPickerButton { "Pick Param" };
     juce::TextButton eraseButton { "Erase Cell" };
     std::array<juce::Label, 3> mixerStripLabels;
     std::array<juce::TextButton, 3> mixerMidiFxButtons;
@@ -671,6 +701,26 @@ private:
     std::array<juce::TextButton, 3> mixerEffectCGuiButtons;
     std::array<juce::TextButton, 3> mixerEffectDButtons;
     std::array<juce::TextButton, 3> mixerEffectDGuiButtons;
+    std::array<juce::TextButton, 3> mixerMidiFxBypassButtons;
+    std::array<juce::TextButton, 3> mixerInstrumentBypassButtons;
+    std::array<juce::TextButton, 3> mixerEffectABypassButtons;
+    std::array<juce::TextButton, 3> mixerEffectBBypassButtons;
+    std::array<juce::TextButton, 3> mixerEffectCBypassButtons;
+    std::array<juce::TextButton, 3> mixerEffectDBypassButtons;
+    std::array<juce::TextButton, 3> mixerMidiFxRemoveButtons;
+    std::array<juce::TextButton, 3> mixerInstrumentRemoveButtons;
+    std::array<juce::TextButton, 3> mixerEffectARemoveButtons;
+    std::array<juce::TextButton, 3> mixerEffectBRemoveButtons;
+    std::array<juce::TextButton, 3> mixerEffectCRemoveButtons;
+    std::array<juce::TextButton, 3> mixerEffectDRemoveButtons;
+    std::array<juce::TextButton, 3> mixerEffectAUpButtons;
+    std::array<juce::TextButton, 3> mixerEffectBUpButtons;
+    std::array<juce::TextButton, 3> mixerEffectCUpButtons;
+    std::array<juce::TextButton, 3> mixerEffectDUpButtons;
+    std::array<juce::TextButton, 3> mixerEffectADownButtons;
+    std::array<juce::TextButton, 3> mixerEffectBDownButtons;
+    std::array<juce::TextButton, 3> mixerEffectCDownButtons;
+    std::array<juce::TextButton, 3> mixerEffectDDownButtons;
     std::array<MeterSlider, 3> mixerVolumeSliders;
     std::array<juce::Slider, 3> mixerPanSliders;
     std::array<juce::Label, 3> mixerVolumeLabels;
@@ -691,6 +741,10 @@ private:
     juce::String currentPatchName { "GlyphGrid" };
     AppMode currentMode = AppMode::glyphGrid;
     ModeVariant currentVariant = ModeVariant::a;
+    CellularRule currentCellularRule = CellularRule::bloom;
+    CellularRuleRange currentCellularBirthRange { 5, 5 };
+    CellularRuleRange currentCellularSurviveRange { 4, 5 };
+    std::array<int, 4> modePresetIndices { 0, 0, 0, 0 };
     int harmonySpaceKeyCenter = 0;
     int harmonySpaceConstraintMode = 0;
     bool harmonySpaceGestureRecordEnabled = false;
