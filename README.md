@@ -10,7 +10,7 @@ The Lattice Experiments are an audiovisual composition tool that use 3D lattice-
 - `A4`: Bonus - based on Simon Holland's Harmony Space
 - `B1..B4`: plugin-hosted versions of the same systems, routed through hosted AU/VST3 channel strips instead of the internal synths
 
-![](https://github.com/maetyu-d/lattice_experiments/blob/main/Screenshot%202026-03-14%20at%2013.42.09.png)
+![](https://github.com/maetyu-d/lattice_experiments/blob/main/Screenshot%202026-03-14%20at%2013.42.09.png) Above - A3: Based on Tymoczko's A Geometry of Music
 
 ## Build and run
 
