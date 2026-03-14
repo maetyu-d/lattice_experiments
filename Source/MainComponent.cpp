@@ -1998,6 +1998,14 @@ bool MainComponent::keyPressed (const juce::KeyPress& key)
         return true;
     }
 
+    if (std::tolower ((unsigned char) key.getTextCharacter()) == 'd' && ! showingTitleScreen)
+    {
+        auto& presetIndex = modePresetIndices[(size_t) modeIndex (currentMode)];
+        presetIndex = (presetIndex + 1) % 3;
+        applyMode (currentMode, currentVariant, false);
+        return true;
+    }
+
     return isViewToggleKey (key) ? toggleStageView() : false;
 }
 
