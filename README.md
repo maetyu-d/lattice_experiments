@@ -1,11 +1,11 @@
-# lattice experiments
+# Lattice Experiments
 
-`lattice experiments` is a JUCE standalone audiovisual composition tool built around several spatial music systems:
+The Lattice Experiments are an audiovisual composition tool that use 3D lattice-type structures to explore several different types of music systems:
 
-- `A1`: GlyphGrid with snake transport and internal synth/drum engine
+- `A1`: 3-D grid with snake transport and internal synth/drum engine
 - `A2`: Cellular Grid with 3D cellular automata transport and internal melodic engine
-- `A3`: Harmonic Geometry
-- `A4`: Harmony Space
+- `A3`: Based on Tymoczko's A Geometry of Music
+- `A4`: Bonus - based on Simon Holland's Harmony Space
 - `B1..B4`: plugin-hosted versions of the same systems, routed through hosted AU/VST3 channel strips instead of the internal synths
 
 ## Build and run
