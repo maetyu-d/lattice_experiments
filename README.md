@@ -1,5 +1,7 @@
 # Lattice Experiments
 
+![](https://github.com/maetyu-d/lattice_experiments/blob/main/Screenshot%202026-03-14%20at%2013.41.30.png)
+
 The Lattice Experiments are an audiovisual composition tool that use 3D lattice-type structures to explore several different types of music systems:
 
 - `A1`: 3-D grid with snake transport and internal synth/drum engine
